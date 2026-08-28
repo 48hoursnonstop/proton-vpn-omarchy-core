@@ -37,12 +37,6 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Prepare the unprivileged build owner
-        shell: bash
-        working-directory: ${{ github.workspace }}
-        run: |
-          chown --recursive builder:builder "$GITHUB_WORKSPACE"
-
       - name: Verify tag signature and release identity
         shell: bash
         working-directory: ${{ github.workspace }}
@@ -53,6 +47,12 @@ jobs:
           gpg --batch --quiet --import RELEASE-SIGNING-KEY.asc
           git verify-tag "$GITHUB_REF_NAME"
           test "$(git rev-parse "$GITHUB_REF_NAME^{commit}")" = "$GITHUB_SHA"
+
+      - name: Prepare the unprivileged build owner
+        shell: bash
+        working-directory: ${{ github.workspace }}
+        run: |
+          chown --recursive builder:builder "$GITHUB_WORKSPACE"
 
       - name: Build and test the exact source
         shell: bash
