@@ -17,6 +17,6 @@ pkgbase = proton-vpn-omarchy
 	options = !debug
 	options = !lto
 	source = proton-vpn-omarchy-0.8.2.tar.gz
-	sha256sums = 3b734bfe57677abb5d1929d41c1ddf2a546656bac88a8ec0aa2d98dc83092e44
+	sha256sums = SKIP
 
 pkgname = proton-vpn-omarchy

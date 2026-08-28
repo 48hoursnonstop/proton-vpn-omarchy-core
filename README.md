@@ -40,7 +40,17 @@ cargo test --locked --workspace
 
 The exact package recipe and metadata are tracked as
 `packaging/arch/PKGBUILD` and `packaging/arch/.SRCINFO`. Release artifacts are
-signed with the key in `RELEASE-SIGNING-KEY.asc`.
+produced from a signed exact tag by the pinned GitHub Actions workflow in
+`.github/workflows/release.yml`. Cargo dependencies are locked, the Arch build
+container and repository snapshot are pinned, and GitHub publishes a Sigstore
+build-provenance bundle for the package. The unchanged CI artifact is then
+signed with the publisher key in `RELEASE-SIGNING-KEY.asc` before the draft
+release is made public.
+
+To reproduce a release source archive and Arch package from a checked-out tag,
+run `packaging/release/build-release VERSION OUTPUT_DIRECTORY`. The command
+rejects a source digest or version that differs from the tracked release
+recipe and uses the tracked `packaging/release/SOURCE_DATE_EPOCH`.
 
 ## Install
 

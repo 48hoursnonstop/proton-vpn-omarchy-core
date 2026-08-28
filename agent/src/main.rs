@@ -1,6 +1,7 @@
 mod autoconnect;
 mod backend;
 mod config;
+mod ipc_bridge;
 mod native_backend;
 mod notifications;
 mod operations;
@@ -19,6 +20,15 @@ use tokio::{signal, sync::watch};
 #[tokio::main]
 async fn main() -> io::Result<()> {
     let config = Config::from_env()?;
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--ipc-bridge")) {
+        if std::env::args_os().nth(2).is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "--ipc-bridge accepts no additional arguments",
+            ));
+        }
+        return ipc_bridge::run(&config.socket_path).await;
+    }
     let (listener, _socket_cleanup) = server::acquire_socket(&config.socket_path).await?;
 
     let (state_tx, state_rx) = watch::channel(StateSnapshot::default());

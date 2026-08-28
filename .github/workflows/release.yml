@@ -1,0 +1,86 @@
+name: Attested release build
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    container:
+      image: archlinux:base-devel@sha256:a26046b7363dad8e2614858f4313949ae9b05c9c5f31de343a54864b9e20806f
+    steps:
+      - name: Check out the exact tag
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Prepare the pinned Arch build environment
+        run: |
+          printf '%s\n' \
+            'Server = https://archive.archlinux.org/repos/2026/08/28/$repo/os/$arch' \
+            >/etc/pacman.d/mirrorlist
+          pacman --sync --refresh --refresh --sysupgrade --noconfirm \
+            dbus git github-cli openssl rust systemd
+          useradd --create-home --user-group builder
+          chown --recursive builder:builder "$GITHUB_WORKSPACE"
+
+      - name: Verify tag signature and release identity
+        run: |
+          export GNUPGHOME
+          GNUPGHOME="$(mktemp -d)"
+          trap 'rm -rf -- "$GNUPGHOME"' EXIT
+          gpg --batch --quiet --import RELEASE-SIGNING-KEY.asc
+          git verify-tag "$GITHUB_REF_NAME"
+          test "$(git rev-parse "$GITHUB_REF_NAME^{commit}")" = "$GITHUB_SHA"
+
+      - name: Build and test the exact source
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          runuser --user builder -- env \
+            HOME=/home/builder \
+            CARGO_HOME=/home/builder/.cargo \
+            "$GITHUB_WORKSPACE/packaging/release/build-release" \
+            "$version" "$GITHUB_WORKSPACE/dist"
+
+      - name: Attest the package provenance
+        id: provenance
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3.0.0
+        with:
+          subject-path: dist/*.pkg.tar.zst
+
+      - name: Assemble immutable draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          package="$(find dist -maxdepth 1 -type f -name '*.pkg.tar.zst' -print -quit)"
+          test -n "$package"
+          cp -- "${{ steps.provenance.outputs.bundle-path }}" \
+            "$package.intoto.jsonl"
+          (
+            cd dist
+            find . -maxdepth 1 -type f ! -name SHA256SUMS -printf '%f\0' \
+              | LC_ALL=C sort -z \
+              | xargs -0 sha256sum -- >SHA256SUMS
+          )
+          printf '%s\n' \
+            'CI-built package and exact-tag source for Proton VPN for Omarchy.' \
+            '' \
+            'The package has GitHub/Sigstore build provenance. This release' \
+            'remains a draft until the unchanged package and checksum manifest' \
+            'receive detached signatures from the published release key.' \
+            >release-notes.md
+          gh release create "$GITHUB_REF_NAME" --draft --verify-tag \
+            --title "Proton VPN for Omarchy Core ${GITHUB_REF_NAME}" \
+            --notes-file release-notes.md dist/*

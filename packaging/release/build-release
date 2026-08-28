@@ -1,0 +1,106 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+readonly version="${1:-}"
+readonly output_argument="${2:-}"
+
+if [[ ! $version =~ ^[0-9]+\.[0-9]+\.[0-9]+$ || -z $output_argument ]]; then
+  printf 'usage: %s VERSION OUTPUT_DIRECTORY\n' "$0" >&2
+  exit 2
+fi
+
+readonly repo_root="$(git rev-parse --show-toplevel)"
+readonly output_dir="$(realpath -m -- "$output_argument")"
+readonly package_name='proton-vpn-omarchy'
+readonly package_version="$version-1"
+readonly source_name="$package_name-$version.tar.gz"
+readonly package_file="$package_name-$package_version-x86_64.pkg.tar.zst"
+readonly source_epoch="$(<"$repo_root/packaging/release/SOURCE_DATE_EPOCH")"
+readonly build_root="$(mktemp -d)"
+
+cleanup() {
+  rm -rf -- "$build_root"
+}
+trap cleanup EXIT
+
+[[ $source_epoch =~ ^[1-9][0-9]*$ ]] || {
+  printf 'packaging/release/SOURCE_DATE_EPOCH must be a positive integer\n' >&2
+  exit 2
+}
+
+readonly head_commit="$(git -C "$repo_root" rev-parse HEAD)"
+readonly tag_commit="$(git -C "$repo_root" rev-parse "v$version^{commit}")"
+[[ $head_commit == "$tag_commit" ]] || {
+  printf 'HEAD is not the exact v%s tag commit\n' "$version" >&2
+  exit 1
+}
+
+for manifest in agent/Cargo.toml protocol/Cargo.toml splitd/Cargo.toml; do
+  grep -Fxq "version = \"$version\"" "$repo_root/$manifest" || {
+    printf '%s does not declare version %s\n' "$manifest" "$version" >&2
+    exit 1
+  }
+done
+grep -Fxq "pkgver=$version" "$repo_root/packaging/arch/PKGBUILD" || {
+  printf 'PKGBUILD does not declare version %s\n' "$version" >&2
+  exit 1
+}
+
+readonly expected_source_sha="$({
+  sed -n "s/^sha256sums=('\([0-9a-f]\{64\}\)')$/\1/p" \
+    "$repo_root/packaging/arch/PKGBUILD"
+} | head -n 1)"
+[[ $expected_source_sha =~ ^[0-9a-f]{64}$ ]] || {
+  printf 'PKGBUILD source digest is not pinned\n' >&2
+  exit 1
+}
+
+mkdir -p -- "$output_dir"
+SOURCE_DATE_EPOCH="$source_epoch" \
+  "$repo_root/scripts/make-source-archive" "$version" "$output_dir/$source_name" \
+  >/dev/null
+
+readonly actual_source_sha="$(sha256sum -- "$output_dir/$source_name")"
+[[ ${actual_source_sha%% *} == "$expected_source_sha" ]] || {
+  printf 'deterministic source archive differs from PKGBUILD digest\n' >&2
+  exit 1
+}
+
+cp -- "$repo_root/packaging/arch/PKGBUILD" "$build_root/PKGBUILD"
+cp -- "$repo_root/packaging/arch/proton-vpn-omarchy.install" "$build_root/"
+cp -- "$output_dir/$source_name" "$build_root/"
+
+(
+  cd -- "$build_root"
+  SOURCE_DATE_EPOCH="$source_epoch" makepkg \
+    --cleanbuild --force --noconfirm --nodeps
+  makepkg --printsrcinfo >default.SRCINFO
+)
+
+cmp --silent "$repo_root/packaging/arch/.SRCINFO" "$build_root/default.SRCINFO" || {
+  printf 'tracked .SRCINFO differs from the release PKGBUILD\n' >&2
+  exit 1
+}
+[[ -f $build_root/$package_file && ! -L $build_root/$package_file ]] || {
+  printf 'expected package was not produced: %s\n' "$package_file" >&2
+  exit 1
+}
+
+cp -- "$build_root/$package_file" "$output_dir/"
+cp -- "$build_root/PKGBUILD" "$output_dir/PKGBUILD"
+cp -- "$build_root/default.SRCINFO" "$output_dir/default.SRCINFO"
+cp -- "$repo_root/packaging/arch/proton-vpn-omarchy.install" "$output_dir/"
+cp -- "$repo_root/RELEASE-SIGNING-KEY.asc" "$output_dir/"
+
+{
+  printf 'source_commit=%s\n' "$head_commit"
+  printf 'source_ref=refs/tags/v%s\n' "$version"
+  printf 'source_date_epoch=%s\n' "$source_epoch"
+  printf 'rustc=%s\n' "$(rustc --version)"
+  printf 'cargo=%s\n' "$(cargo --version)"
+  printf 'makepkg=%s\n' "$(makepkg --version | head -n 1)"
+  printf '\n[packages]\n'
+  pacman -Q | LC_ALL=C sort
+} >"$output_dir/BUILD-ENVIRONMENT.txt"
+
+printf '%s\n' "$output_dir/$package_file"
