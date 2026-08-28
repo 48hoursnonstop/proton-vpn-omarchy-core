@@ -99,6 +99,8 @@ jobs:
             'remains a draft until the unchanged package and checksum manifest' \
             'receive detached signatures from the published release key.' \
             >release-notes.md
-          gh release create "$GITHUB_REF_NAME" --draft --verify-tag \
+          gh release create "$GITHUB_REF_NAME" \
+            --repo 48hoursnonstop/proton-vpn-omarchy-core \
+            --draft --verify-tag \
             --title "Proton VPN for Omarchy Core ${GITHUB_REF_NAME}" \
             --notes-file release-notes.md dist/*
