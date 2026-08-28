@@ -20,12 +20,6 @@ jobs:
     container:
       image: archlinux:base-devel@sha256:a26046b7363dad8e2614858f4313949ae9b05c9c5f31de343a54864b9e20806f
     steps:
-      - name: Check out the exact tag
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-
       - name: Prepare the pinned Arch build environment
         shell: bash
         working-directory: ${{ github.workspace }}
@@ -36,6 +30,17 @@ jobs:
           pacman --sync --refresh --refresh --sysupgrade --noconfirm \
             dbus git github-cli openssl rust systemd
           useradd --create-home --user-group builder
+
+      - name: Check out the exact tag
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Prepare the unprivileged build owner
+        shell: bash
+        working-directory: ${{ github.workspace }}
+        run: |
           chown --recursive builder:builder "$GITHUB_WORKSPACE"
 
       - name: Verify tag signature and release identity

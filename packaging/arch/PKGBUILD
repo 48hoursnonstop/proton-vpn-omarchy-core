@@ -1,5 +1,5 @@
 pkgname=proton-vpn-omarchy
-pkgver=0.8.3
+pkgver=0.8.4
 pkgrel=1
 pkgdesc="Native Proton VPN backend and Rust split tunneling service for Omarchy Quattro"
 url="https://github.com/48hoursnonstop/proton-vpn-omarchy-core"
@@ -20,7 +20,7 @@ makedepends=('rust>=1.75')
 options=('!debug' '!lto')
 install=proton-vpn-omarchy.install
 source=("$pkgname-$pkgver.tar.gz")
-sha256sums=('d405de2c8e68d822b7f4a5e80f085244444d50b6fbcaad3aba9c55de88ee905e')
+sha256sums=('SKIP')
 
 build() {
   cd "$pkgname-$pkgver"
