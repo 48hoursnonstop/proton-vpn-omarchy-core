@@ -9,7 +9,8 @@ if [[ ! $version =~ ^[0-9]+\.[0-9]+\.[0-9]+$ || -z $output_argument ]]; then
   exit 2
 fi
 
-readonly repo_root="$(git rev-parse --show-toplevel)"
+readonly script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+readonly repo_root="$(git -C "$script_dir/../.." rev-parse --show-toplevel)"
 readonly output_dir="$(realpath -m -- "$output_argument")"
 readonly package_name='proton-vpn-omarchy'
 readonly package_version="$version-1"
