@@ -499,6 +499,19 @@ pub(crate) fn apply_event(
                     .get("restriction_reason_code")
                     .and_then(Value::as_i64)
                     .and_then(|value| i32::try_from(value).ok());
+                if let Some(conflicts) = data.get("network_conflicts").and_then(Value::as_array) {
+                    state.connection.network_conflicts = conflicts
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .take(16)
+                        .map(str::to_owned)
+                        .collect();
+                } else if matches!(
+                    state.connection.status,
+                    ConnectionStatus::Connected | ConnectionStatus::Disconnected
+                ) {
+                    state.connection.network_conflicts.clear();
+                }
 
                 if let Some(secure_core) = data.get("secure_core").and_then(Value::as_bool) {
                     state.features.secure_core = secure_core;

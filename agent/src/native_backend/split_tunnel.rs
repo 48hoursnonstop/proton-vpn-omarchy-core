@@ -50,6 +50,23 @@ impl SplitTunnelBackend {
         Ok(())
     }
 
+    pub fn set_kill_switch_bypass(
+        &self,
+        enabled: bool,
+        routes: Vec<(String, String, String)>,
+    ) -> NativeResult<()> {
+        let connection = system_bus()?;
+        let proxy = connection.with_proxy(SERVICE, PATH, Duration::from_secs(8));
+        let _: () = proxy
+            .method_call(
+                INTERFACE,
+                "SetKillSwitchBypass",
+                (current_uid()?, enabled, routes),
+            )
+            .map_err(|error| split_error("configure Kill Switch bypass through", error))?;
+        Ok(())
+    }
+
     fn get_config(&self) -> NativeResult<PropMap> {
         let connection = system_bus()?;
         let proxy = connection.with_proxy(SERVICE, PATH, Duration::from_secs(5));

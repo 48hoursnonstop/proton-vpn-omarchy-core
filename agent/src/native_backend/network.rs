@@ -527,6 +527,151 @@ impl OpenVpnProfile {
 pub struct NetworkManagerBackend;
 
 impl NetworkManagerBackend {
+    pub fn conflicting_interfaces(&self) -> NativeResult<Vec<String>> {
+        let connection = system_bus()?;
+        let root = connection.with_proxy(NM_BUS, NM_PATH, Duration::from_secs(5));
+        let mut conflicts = HashSet::new();
+        for active_path in root
+            .active_connections()
+            .map_err(|error| nm_error("list active NetworkManager connections", error))?
+        {
+            let active = connection.with_proxy(NM_BUS, active_path, Duration::from_secs(5));
+            if ConnectionActive::state(&active).unwrap_or(0) != 2 {
+                continue;
+            }
+            let profile_path = match active.connection() {
+                Ok(path) => path,
+                Err(_) => continue,
+            };
+            let profile = connection.with_proxy(NM_BUS, profile_path, Duration::from_secs(5));
+            let settings = match profile.get_settings() {
+                Ok(settings) => settings,
+                Err(_) => continue,
+            };
+            if profile_owned(&settings) || proton_system_profile(&settings) {
+                continue;
+            }
+            let connection_type = active.type_().unwrap_or_default().to_ascii_lowercase();
+            let is_vpn = active.vpn().unwrap_or(false)
+                || matches!(connection_type.as_str(), "vpn" | "wireguard");
+            if !is_vpn {
+                continue;
+            }
+            let id = active.id().unwrap_or_else(|_| "VPN".into());
+            let interfaces = ConnectionActive::devices(&active)
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|path| {
+                    let device = connection.with_proxy(NM_BUS, path, Duration::from_secs(3));
+                    Device::interface(&device).ok()
+                })
+                .collect::<Vec<_>>();
+            conflicts.insert(conflict_label(&id, interfaces.first().map(String::as_str)));
+        }
+
+        // Some VPNs (for example Tailscale and command-line WireGuard) create
+        // unmanaged interfaces, so they do not appear as active NM profiles.
+        if let Ok(entries) = fs::read_dir("/sys/class/net") {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if !is_conflicting_tunnel_name(&name) {
+                    continue;
+                }
+                let up = fs::read_to_string(entry.path().join("operstate"))
+                    .map(|state| matches!(state.trim(), "up" | "unknown"))
+                    .unwrap_or(false);
+                if up {
+                    conflicts.insert(name);
+                }
+            }
+        }
+        let mut conflicts = conflicts.into_iter().collect::<Vec<_>>();
+        conflicts.sort_by_key(|value| value.to_ascii_lowercase());
+        conflicts.truncate(16);
+        Ok(conflicts)
+    }
+
+    pub fn physical_default_routes(&self) -> NativeResult<Vec<(String, String, String)>> {
+        let connection = system_bus()?;
+        let root = connection.with_proxy(NM_BUS, NM_PATH, Duration::from_secs(5));
+        let mut physical_interfaces = HashSet::new();
+        for device_path in NetworkManager::devices(&root)
+            .map_err(|error| nm_error("list NetworkManager devices", error))?
+        {
+            let device = connection.with_proxy(NM_BUS, device_path, Duration::from_secs(5));
+            if Device::state(&device).unwrap_or(0) == 100
+                && matches!(device.device_type().unwrap_or(0), 1 | 2)
+            {
+                if let Ok(interface) = Device::interface(&device) {
+                    if !interface.is_empty() {
+                        physical_interfaces.insert(interface);
+                    }
+                }
+            }
+        }
+        let mut routes = Vec::new();
+        for (family, flag) in [("ipv4", "-4"), ("ipv6", "-6")] {
+            let output = Command::new("/usr/bin/ip")
+                .args([flag, "-j", "route", "show", "table", "main", "default"])
+                .output()
+                .map_err(|error| {
+                    NativeError::new(
+                        "physical_route_unavailable",
+                        "Unable to inspect the physical default route",
+                    )
+                    .with_source(error)
+                })?;
+            if !output.status.success() {
+                return Err(NativeError::new(
+                    "physical_route_unavailable",
+                    "The kernel did not return the physical default route",
+                )
+                .with_details(json!({
+                    "family": family,
+                    "stderr": String::from_utf8_lossy(&output.stderr).trim(),
+                })));
+            }
+            let values: Vec<Value> = serde_json::from_slice(&output.stdout).map_err(|error| {
+                NativeError::new(
+                    "physical_route_unavailable",
+                    "The kernel returned an invalid default-route description",
+                )
+                .with_source(error)
+            })?;
+            let preferred = values
+                .into_iter()
+                .filter_map(|value| {
+                    let interface = value.get("dev")?.as_str()?;
+                    physical_interfaces.contains(interface).then(|| {
+                        (
+                            value
+                                .get("metric")
+                                .and_then(Value::as_u64)
+                                .unwrap_or(u64::MAX),
+                            value
+                                .get("gateway")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_owned(),
+                            interface.to_owned(),
+                        )
+                    })
+                })
+                .min_by(|left, right| (left.0, &left.2).cmp(&(right.0, &right.2)));
+            if let Some((_, gateway, interface)) = preferred {
+                routes.push((family.into(), gateway, interface));
+            }
+        }
+        if routes.is_empty() {
+            return Err(NativeError::new(
+                "physical_route_unavailable",
+                "No active Ethernet or Wi-Fi default route is available for split tunneling",
+            )
+            .retryable(true));
+        }
+        Ok(routes)
+    }
+
     pub fn physical_dns_servers(&self) -> NativeResult<Vec<String>> {
         let connection = system_bus()?;
         let root = connection.with_proxy(NM_BUS, NM_PATH, Duration::from_secs(5));
@@ -1275,6 +1420,56 @@ fn profile_owned(settings: &HashMap<String, PropMap>) -> bool {
         || connection_owned(settings)
 }
 
+fn proton_system_profile(settings: &HashMap<String, PropMap>) -> bool {
+    matches!(
+        connection_id(settings).as_deref(),
+        Some(
+            IPV6_LEAK_CONNECTION_ID
+                | KILL_SWITCH_CONNECTION_ID
+                | KILL_SWITCH_PERMANENT_CONNECTION_ID
+        )
+    ) || matches!(
+        service_type(settings).as_deref(),
+        Some(PROTUN_SERVICE | OPENVPN_SERVICE)
+    )
+}
+
+fn conflict_label(id: &str, interface: Option<&str>) -> String {
+    match interface.filter(|interface| !interface.is_empty()) {
+        Some(interface) if !id.eq_ignore_ascii_case(interface) => format!("{id} ({interface})"),
+        Some(interface) => interface.to_owned(),
+        None => id.to_owned(),
+    }
+}
+
+fn is_conflicting_tunnel_name(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    if matches!(
+        name.as_str(),
+        PROTUN_INTERFACE
+            | IPV6_LEAK_INTERFACE
+            | KILL_SWITCH_INTERFACE
+            | KILL_SWITCH_PERMANENT_INTERFACE
+    ) {
+        return false;
+    }
+    [
+        "tun",
+        "tap",
+        "wg",
+        "tailscale",
+        "warp",
+        "zt",
+        "ham",
+        "nordlynx",
+        "mullvad",
+        "ivpn",
+        "pia",
+    ]
+    .iter()
+    .any(|prefix| name.starts_with(prefix))
+}
+
 fn connection_owned(settings: &HashMap<String, PropMap>) -> bool {
     settings
         .get("connection")
@@ -1663,5 +1858,17 @@ mod tests {
         for address in ["1.1.1.1", "8.8.8.8", "2001:4860:4860::8888"] {
             assert!(!is_local_resolver(&address.parse().unwrap()), "{address}");
         }
+    }
+
+    #[test]
+    fn conflict_detection_excludes_our_interfaces_and_recognizes_other_tunnels() {
+        assert!(!is_conflicting_tunnel_name(PROTUN_INTERFACE));
+        assert!(!is_conflicting_tunnel_name(KILL_SWITCH_INTERFACE));
+        assert!(!is_conflicting_tunnel_name(IPV6_LEAK_INTERFACE));
+        assert!(is_conflicting_tunnel_name("tun0"));
+        assert!(is_conflicting_tunnel_name("wg-office"));
+        assert!(is_conflicting_tunnel_name("tailscale0"));
+        assert!(!is_conflicting_tunnel_name("wlp0s20f3"));
+        assert_eq!(conflict_label("Work VPN", Some("tun0")), "Work VPN (tun0)");
     }
 }

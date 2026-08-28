@@ -45,6 +45,7 @@ pub const STORE_METHODS: &[&str] = &[
     "preferences.set",
     "profiles.list",
     "profiles.save",
+    "profiles.duplicate",
     "profiles.delete",
     "excluded_locations.get",
     "excluded_locations.set",
@@ -470,6 +471,9 @@ pub struct ConnectionState {
     /// Raw Proton Local Agent reason code, when the server supplied one.
     #[serde(default)]
     pub restriction_reason_code: Option<i32>,
+    /// Active non-Proton tunnel interfaces that can interfere with route setup.
+    #[serde(default)]
+    pub network_conflicts: Vec<String>,
 }
 
 impl Default for ConnectionState {
@@ -494,6 +498,7 @@ impl Default for ConnectionState {
             error: None,
             error_code: None,
             restriction_reason_code: None,
+            network_conflicts: Vec::new(),
         }
     }
 }

@@ -46,7 +46,7 @@ signed with the key in `RELEASE-SIGNING-KEY.asc`.
 
 Use the guided, signature-verifying installer in the [Omarchy plugin][plugin].
 It installs the matching package and configures systemd socket activation.
-Manual package downloads remain available from the [0.8.1 release][release].
+Manual package downloads remain available from the [0.8.2 release][release].
 
 ## Security and license
 
@@ -58,4 +58,4 @@ Original project code is GPL-3.0-or-later. Vendored and upstream-derived files
 retain their own notices and license files; see `NOTICE.md`.
 
 [plugin]: https://github.com/48hoursnonstop/proton-vpn-omarchy
-[release]: https://github.com/48hoursnonstop/proton-vpn-omarchy-core/releases/tag/v0.8.1
+[release]: https://github.com/48hoursnonstop/proton-vpn-omarchy-core/releases/tag/v0.8.2

@@ -227,6 +227,8 @@ struct NativeRuntime {
     owned_connection_uuid: Mutex<Option<String>>,
     split_available: AtomicBool,
     destination_policy_available: AtomicBool,
+    split_kill_switch_bypass_active: AtomicBool,
+    split_route_write: Mutex<()>,
     connection_attempt: AtomicU64,
 }
 
@@ -283,6 +285,8 @@ async fn run(mut rx: mpsc::Receiver<BackendRequest>, events: EventSink) {
         owned_connection_uuid: Mutex::new(None),
         split_available: AtomicBool::new(false),
         destination_policy_available: AtomicBool::new(false),
+        split_kill_switch_bypass_active: AtomicBool::new(false),
+        split_route_write: Mutex::new(()),
         connection_attempt: AtomicU64::new(0),
     });
 
@@ -347,6 +351,38 @@ impl NativeRuntime {
                             "proton-omarchy-agent: destination policy reconciliation failed: {error}"
                         );
                     }
+                }
+            }
+        });
+
+        let split_route_runtime = Arc::downgrade(runtime);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(5));
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                let Some(runtime) = split_route_runtime.upgrade() else {
+                    return;
+                };
+                if !runtime
+                    .split_kill_switch_bypass_active
+                    .load(Ordering::Acquire)
+                {
+                    continue;
+                }
+                let observation = match runtime.observe_blocking().await {
+                    Ok(observation) => observation,
+                    Err(_) => continue,
+                };
+                let settings = runtime.state.read().await.settings.clone();
+                let active = observation.owned && observation.state == TunnelState::Connected;
+                if let Err(error) = runtime
+                    .reconcile_split_kill_switch_bypass(&settings, active)
+                    .await
+                {
+                    eprintln!(
+                        "proton-omarchy-agent: split/kill-switch route reconciliation failed: {error}"
+                    );
                 }
             }
         });
@@ -430,15 +466,26 @@ impl NativeRuntime {
                             state.settings.ipv6_leak_protection,
                         )
                     };
-                    if let Err(error) = self
+                    let kill_switch_result = self
                         .reconcile_kill_switch(
                             mode,
                             observation.state == TunnelState::Connected,
                             server_ip,
                             ipv6_leak_protection,
                         )
-                        .await
-                    {
+                        .await;
+                    let combined_result = match kill_switch_result {
+                        Ok(()) => {
+                            let settings = self.state.read().await.settings.clone();
+                            self.reconcile_split_kill_switch_bypass(
+                                &settings,
+                                observation.owned && observation.state == TunnelState::Connected,
+                            )
+                            .await
+                        }
+                        Err(error) => Err(error),
+                    };
+                    if let Err(error) = combined_result {
                         self.emit_connection(&observation, Some(&error.message))
                             .await;
                         if observation.owned {
@@ -1320,12 +1367,6 @@ impl NativeRuntime {
                             "kill_switch value must be off, standard or advanced",
                         )
                     })?;
-                if mode != 0 && settings.features.split_tunneling.enabled {
-                    return Err(NativeError::new(
-                        "split_tunneling_kill_switch_conflict",
-                        "Disable Split Tunneling before enabling Kill Switch",
-                    ));
-                }
                 settings.killswitch = mode;
             }
             "netshield" => {
@@ -1427,6 +1468,8 @@ impl NativeRuntime {
                 })
                 .flatten();
             if settings.killswitch == 0 && previous.killswitch != 0 {
+                self.reconcile_split_kill_switch_bypass(&previous, false)
+                    .await?;
                 self.reconcile_kill_switch(
                     previous.killswitch,
                     false,
@@ -1435,7 +1478,7 @@ impl NativeRuntime {
                 )
                 .await?;
             }
-            if let Err(error) = self
+            let applied = match self
                 .reconcile_kill_switch(
                     settings.killswitch,
                     active,
@@ -1444,6 +1487,13 @@ impl NativeRuntime {
                 )
                 .await
             {
+                Ok(()) => {
+                    self.reconcile_split_kill_switch_bypass(&settings, active)
+                        .await
+                }
+                Err(error) => Err(error),
+            };
+            if let Err(error) = applied {
                 let _ = self
                     .reconcile_kill_switch(
                         previous.killswitch,
@@ -1451,6 +1501,9 @@ impl NativeRuntime {
                         server_ip,
                         previous.ipv6_leak_protection,
                     )
+                    .await;
+                let _ = self
+                    .reconcile_split_kill_switch_bypass(&previous, active)
                     .await;
                 return Err(error);
             }
@@ -1480,6 +1533,9 @@ impl NativeRuntime {
                         server_ip,
                         previous.ipv6_leak_protection,
                     )
+                    .await;
+                let _ = self
+                    .reconcile_split_kill_switch_bypass(&previous, active)
                     .await;
                 return Err(error);
             }
@@ -1527,6 +1583,9 @@ impl NativeRuntime {
                         server_ip,
                         previous.ipv6_leak_protection,
                     )
+                    .await;
+                let _ = self
+                    .reconcile_split_kill_switch_bypass(&previous, active)
                     .await;
             } else if matches!(
                 feature.as_str(),
@@ -1593,6 +1652,39 @@ impl NativeRuntime {
             self.emit_backend_state(None).await;
         }
         result
+    }
+
+    async fn reconcile_split_kill_switch_bypass(
+        &self,
+        settings: &NativeSettings,
+        tunnel_active: bool,
+    ) -> NativeResult<()> {
+        let _write = self.split_route_write.lock().await;
+        let enabled =
+            tunnel_active && settings.killswitch != 0 && settings.features.split_tunneling.enabled;
+        let combination_configured =
+            settings.killswitch != 0 && settings.features.split_tunneling.enabled;
+        if !enabled
+            && !combination_configured
+            && !self.split_kill_switch_bypass_active.load(Ordering::Acquire)
+        {
+            return Ok(());
+        }
+        let routes = if enabled {
+            let network = self.network.clone();
+            tokio::task::spawn_blocking(move || network.physical_default_routes())
+                .await
+                .map_err(join_error)??
+        } else {
+            Vec::new()
+        };
+        let split_tunnel = self.split_tunnel.clone();
+        tokio::task::spawn_blocking(move || split_tunnel.set_kill_switch_bypass(enabled, routes))
+            .await
+            .map_err(join_error)??;
+        self.split_kill_switch_bypass_active
+            .store(enabled, Ordering::Release);
+        Ok(())
     }
 
     async fn emit_backend_state(&self, initialization_error: Option<String>) {
@@ -1722,12 +1814,6 @@ impl NativeRuntime {
 
         let _write = self.settings_write.lock().await;
         let previous = self.state.read().await.settings.clone();
-        if enabled && previous.killswitch != 0 {
-            return Err(NativeError::new(
-                "split_tunneling_kill_switch_conflict",
-                "Disable Kill Switch before enabling Split Tunneling",
-            ));
-        }
         let previous_standard = previous.features.split_tunneling.config("exclude");
         let previous_inverse = previous.features.split_tunneling.config("include");
         let standard = split_request_config(&params, "standard", "exclude", &previous_standard)?;
@@ -1758,18 +1844,41 @@ impl NativeRuntime {
             .config_by_mode
             .insert("include".into(), inverse);
         let active = settings.features.split_tunneling.config(mode);
+        let observation = self.observe_blocking().await?;
+        let tunnel_active = observation.state == TunnelState::Connected;
+        if tunnel_active && !observation.owned {
+            return Err(NativeError::new(
+                "connection_not_owned",
+                "Reconnect with the native backend before changing Split Tunneling",
+            ));
+        }
 
         self.events.stage(
             "split_tunneling.set",
             "settings.applying_split_tunneling",
             false,
         );
+        if tunnel_active && previous.killswitch != 0 && previous.features.split_tunneling.enabled {
+            self.reconcile_split_kill_switch_bypass(&previous, false)
+                .await?;
+        }
         let split_tunnel = self.split_tunnel.clone();
         let active_for_apply = active.clone();
-        tokio::task::spawn_blocking(move || split_tunnel.apply(enabled, &active_for_apply))
+        let apply_result =
+            tokio::task::spawn_blocking(move || split_tunnel.apply(enabled, &active_for_apply))
+                .await
+                .map_err(join_error)
+                .and_then(|result| result);
+        if let Err(error) = apply_result {
+            let _ = self
+                .reconcile_split_kill_switch_bypass(&previous, tunnel_active)
+                .await;
+            return Err(error);
+        }
+        if let Err(error) = self
+            .reconcile_split_kill_switch_bypass(&settings, tunnel_active)
             .await
-            .map_err(join_error)??;
-        if let Err(error) = self.persist_settings(settings).await {
+        {
             let rollback = previous.features.split_tunneling.clone();
             let rollback_config = rollback.config(&rollback.mode);
             let split_tunnel = self.split_tunnel.clone();
@@ -1777,6 +1886,25 @@ impl NativeRuntime {
                 split_tunnel.apply(rollback.enabled, &rollback_config)
             })
             .await;
+            let _ = self
+                .reconcile_split_kill_switch_bypass(&previous, tunnel_active)
+                .await;
+            return Err(error);
+        }
+        if let Err(error) = self.persist_settings(settings.clone()).await {
+            let _ = self
+                .reconcile_split_kill_switch_bypass(&settings, false)
+                .await;
+            let rollback = previous.features.split_tunneling.clone();
+            let rollback_config = rollback.config(&rollback.mode);
+            let split_tunnel = self.split_tunnel.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                split_tunnel.apply(rollback.enabled, &rollback_config)
+            })
+            .await;
+            let _ = self
+                .reconcile_split_kill_switch_bypass(&previous, tunnel_active)
+                .await;
             return Err(error);
         }
         self.emit_features().await;
@@ -1861,6 +1989,14 @@ impl NativeRuntime {
         };
 
         let profile = VpnProfile::new(&target, &protocol, &session, &client_config, &settings)?;
+        let conflict_network = self.network.clone();
+        let network_conflicts = tokio::task::spawn_blocking(move || {
+            conflict_network
+                .conflicting_interfaces()
+                .unwrap_or_default()
+        })
+        .await
+        .map_err(join_error)?;
         let attempt = self.connection_attempt.fetch_add(1, Ordering::SeqCst) + 1;
         self.events
             .stage("connection.connect", "tunnel.connecting", true);
@@ -1873,6 +2009,8 @@ impl NativeRuntime {
                 "protocol": protocol,
                 "secure_core": target.logical.features & models::FEATURE_SECURE_CORE != 0,
                 "error": null,
+                "error_code": null,
+                "network_conflicts": network_conflicts.clone(),
             }),
         );
 
@@ -1906,6 +2044,7 @@ impl NativeRuntime {
         let activation = match activation {
             Ok(activation) => activation,
             Err(error) => {
+                let error = with_network_conflicts(error, &network_conflicts);
                 self.events.emit(
                     "connection",
                     json!({
@@ -1914,7 +2053,9 @@ impl NativeRuntime {
                         "server": target.logical.serialized(),
                         "protocol": protocol,
                         "secure_core": target.logical.features & models::FEATURE_SECURE_CORE != 0,
-                        "error": error.message,
+                        "error": error.message.clone(),
+                        "error_code": error.code.clone(),
+                        "network_conflicts": network_conflicts.clone(),
                     }),
                 );
                 return Err(error);
@@ -1941,6 +2082,13 @@ impl NativeRuntime {
             let observation = self.observe_blocking().await?;
             match observation.state {
                 TunnelState::Connected => {
+                    if let Err(error) = self
+                        .reconcile_split_kill_switch_bypass(&settings, true)
+                        .await
+                    {
+                        self.cleanup_owned_connection(profile.uuid()).await;
+                        return Err(error);
+                    }
                     self.events
                         .stage("connection.connect", "tunnel.securing_session", true);
                     let requested =
@@ -1988,12 +2136,15 @@ impl NativeRuntime {
                     }));
                 }
                 TunnelState::Error => {
-                    let error = NativeError::new(
-                        "connection_failed",
-                        "NetworkManager reported that the VPN tunnel failed",
-                    )
-                    .with_details(json!({ "protocol": protocol }))
-                    .retryable(true);
+                    let error = with_network_conflicts(
+                        NativeError::new(
+                            "connection_failed",
+                            "NetworkManager reported that the VPN tunnel failed",
+                        )
+                        .with_details(json!({ "protocol": protocol }))
+                        .retryable(true),
+                        &network_conflicts,
+                    );
                     self.emit_connection(&observation, Some(&error.message))
                         .await;
                     self.cleanup_owned_connection(profile.uuid()).await;
@@ -2003,21 +2154,27 @@ impl NativeRuntime {
                     if Instant::now().duration_since(started_at) >= Duration::from_secs(2) =>
                 {
                     self.cleanup_owned_connection(profile.uuid()).await;
-                    return Err(NativeError::new(
-                        "connection_failed",
-                        "The VPN service stopped before the tunnel became ready",
-                    )
-                    .with_details(json!({ "protocol": protocol }))
-                    .retryable(true));
+                    return Err(with_network_conflicts(
+                        NativeError::new(
+                            "connection_failed",
+                            "The VPN service stopped before the tunnel became ready",
+                        )
+                        .with_details(json!({ "protocol": protocol }))
+                        .retryable(true),
+                        &network_conflicts,
+                    ));
                 }
                 _ if Instant::now() >= deadline => {
                     self.cleanup_owned_connection(profile.uuid()).await;
-                    return Err(NativeError::new(
-                        "connection_timeout",
-                        "VPN connection timed out before the tunnel became ready",
-                    )
-                    .with_details(json!({ "protocol": protocol }))
-                    .retryable(true));
+                    return Err(with_network_conflicts(
+                        NativeError::new(
+                            "connection_timeout",
+                            "VPN connection timed out before the tunnel became ready",
+                        )
+                        .with_details(json!({ "protocol": protocol }))
+                        .retryable(true),
+                        &network_conflicts,
+                    ));
                 }
                 _ => tokio::time::sleep(CONNECTION_POLL_INTERVAL).await,
             }
@@ -2065,18 +2222,23 @@ impl NativeRuntime {
     }
 
     async fn disconnect_owned_inner(&self, uuid: &str) -> NativeResult<()> {
-        self.stop_local_agent().await;
-        let (kill_switch_mode, server_ip, ipv6_leak_protection) = {
+        let (settings, server_ip) = {
             let state = self.state.read().await;
             (
-                state.settings.killswitch,
+                state.settings.clone(),
                 state
                     .selected
                     .as_ref()
                     .map(|target| target.physical.entry_ip.clone()),
-                state.settings.ipv6_leak_protection,
             )
         };
+        // Remove the only physical bypass before taking the tunnel down. If
+        // this fails, keep the tunnel up so protected traffic cannot leak.
+        self.reconcile_split_kill_switch_bypass(&settings, false)
+            .await?;
+        self.stop_local_agent().await;
+        let kill_switch_mode = settings.killswitch;
+        let ipv6_leak_protection = settings.ipv6_leak_protection;
         let network = self.network.clone();
         let uuid_for_disconnect = uuid.to_owned();
         tokio::task::spawn_blocking(move || {
@@ -3295,6 +3457,22 @@ fn join_error(error: tokio::task::JoinError) -> NativeError {
         "A Rust backend worker stopped unexpectedly",
     )
     .with_source(error)
+    .retryable(true)
+}
+
+fn with_network_conflicts(error: NativeError, conflicts: &[String]) -> NativeError {
+    if conflicts.is_empty() {
+        return error;
+    }
+    NativeError::new(
+        "network_conflict_detected",
+        "Another active VPN or tunnel interface might be preventing Proton VPN from connecting",
+    )
+    .with_details(json!({
+        "interfaces": conflicts,
+        "underlying_code": error.code,
+        "underlying_error": error.message,
+    }))
     .retryable(true)
 }
 

@@ -136,7 +136,7 @@ explicit `{"selection":{"type":"recent","recentId":"..."}}` or profile selection
 authority. It returns validated `connect_params` and an optional canonical recent to record after
 the frontend has submitted `connection.connect`.
 
-Mutations are `onboarding.complete`, `preferences.set`, `profiles.save`, `profiles.delete`,
+Mutations are `onboarding.complete`, `preferences.set`, `profiles.save`, `profiles.duplicate`, `profiles.delete`,
 `recents.record`, `recents.pin`, `recents.delete` and `default_connection.set`. They use the
 observable `store` operation domain, atomic same-directory replacement, a 1 MiB total store cap,
 128-profile cap and six-unpinned-recent policy. The file and its dedicated directory are private to
@@ -357,8 +357,9 @@ their canonical network address before persistence and enforcement.
 - embedded NUL/newline characters are rejected;
 - at most 256 IPv4/IPv6 host or CIDR entries per mode;
 - the active mode requires at least one selected application or IP range when enabled;
-- enabling Split Tunneling while Kill Switch is not Off returns
-  `split_tunneling_kill_switch_conflict`;
+- Kill Switch and Split Tunneling may be enabled together. Excluded sockets receive the
+  Proton-compatible mark and a UID-scoped policy route to the active physical gateway; unmarked
+  traffic continues to follow Kill Switch and therefore remains fail-closed;
 - unavailable Proton split service returns `split_tunneling_unavailable`;
 - malformed IP/CIDR entries return `invalid_split_ip_ranges`.
 

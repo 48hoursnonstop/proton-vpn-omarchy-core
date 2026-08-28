@@ -3,10 +3,12 @@ mod engine;
 mod model;
 mod proc_events;
 mod procfs;
+mod routing;
 mod store;
 
 use engine::Engine;
 use model::{validate_ip_ranges, SplitConfig, SplitMode};
+use routing::PhysicalRoute;
 use std::{
     collections::HashMap,
     io,
@@ -103,6 +105,34 @@ impl SplitTunnelService {
     ) -> fdo::Result<Vec<String>> {
         self.authorize(&header, uid).await?;
         Ok(self.engine.destination_policy(uid).await)
+    }
+
+    /// Enables the policy route used by excluded split-tunnel traffic while
+    /// Kill Switch is active. The rule is scoped to both our socket mark and
+    /// the caller UID; unmarked traffic remains fail-closed.
+    #[zbus(name = "SetKillSwitchBypass")]
+    async fn set_kill_switch_bypass(
+        &self,
+        uid: u16,
+        enabled: bool,
+        routes: Vec<(String, String, String)>,
+        #[zbus(header)] header: Header<'_>,
+    ) -> fdo::Result<()> {
+        self.authorize(&header, uid).await?;
+        if routes.len() > 8 {
+            return Err(fdo::Error::InvalidArgs(
+                "at most eight physical routes are accepted".into(),
+            ));
+        }
+        let routes = routes
+            .into_iter()
+            .map(|(family, gateway, interface)| PhysicalRoute::parse(&family, &gateway, &interface))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(fdo::Error::InvalidArgs)?;
+        self.engine
+            .set_kill_switch_bypass(uid, enabled, routes)
+            .await
+            .map_err(|error| fdo::Error::Failed(error.to_string()))
     }
 
     #[zbus(name = "GetAllConfigs")]

@@ -3,6 +3,7 @@ use crate::{
     model::{ConfigMap, PolicyMap, SplitConfig, MAX_CONFIGS},
     proc_events::{ProcessConnector, ProcessEvent},
     procfs::{self, ProcessInfo},
+    routing::{self, PhysicalRoute},
     store::StateStore,
 };
 use std::{
@@ -33,6 +34,7 @@ struct Inner {
     destination_policies: PolicyMap,
     marker: Option<SocketMarker>,
     tracked: HashMap<u32, TrackedProcess>,
+    kill_switch_bypass: std::collections::BTreeMap<u16, Vec<PhysicalRoute>>,
 }
 
 pub struct Engine {
@@ -41,19 +43,25 @@ pub struct Engine {
     _connector: ProcessConnector,
     event_task: JoinHandle<()>,
     reconcile_task: JoinHandle<()>,
+    routing_enabled: bool,
 }
 
 impl Engine {
     pub fn new() -> io::Result<Self> {
-        Self::with_store(StateStore::system())
+        Self::with_store(StateStore::system(), true)
     }
 
     pub fn ephemeral() -> io::Result<Self> {
-        Self::with_store(StateStore::ephemeral())
+        Self::with_store(StateStore::ephemeral(), false)
     }
 
-    fn with_store(store: StateStore) -> io::Result<Self> {
+    fn with_store(store: StateStore, routing_enabled: bool) -> io::Result<Self> {
         let loaded = store.load()?;
+        if routing_enabled {
+            for uid in loaded.configs.keys().copied() {
+                routing::disable(uid)?;
+            }
+        }
         let mut initial = Inner {
             configs: loaded.configs,
             destination_policies: loaded.destination_policies,
@@ -127,12 +135,14 @@ impl Engine {
             _connector: connector,
             event_task,
             reconcile_task,
+            routing_enabled,
         })
     }
 
     pub async fn set_config(&self, uid: u16, config: SplitConfig) -> io::Result<()> {
         let inner = Arc::clone(&self.inner);
         let store = self.store.clone();
+        let routing_enabled = self.routing_enabled;
         tokio::task::spawn_blocking(move || {
             let mut inner = lock_inner(&inner)?;
             if !inner.configs.contains_key(&uid)
@@ -144,6 +154,15 @@ impl Engine {
                     format!("at most {MAX_CONFIGS} users may configure split tunneling"),
                 ));
             }
+            let bypass = if routing_enabled && !config.has_rules() {
+                let bypass = inner.kill_switch_bypass.remove(&uid);
+                if bypass.is_some() {
+                    routing::disable(uid)?;
+                }
+                bypass
+            } else {
+                None
+            };
             let previous = inner.configs.insert(uid, config);
             if let Err(error) = reconcile(&mut inner)
                 .and_then(|()| store.save(&inner.configs, &inner.destination_policies))
@@ -157,6 +176,11 @@ impl Engine {
                     }
                 }
                 let _ = reconcile(&mut inner);
+                if let Some(routes) = bypass {
+                    if let Ok(installed) = routing::enable(uid, &routes) {
+                        inner.kill_switch_bypass.insert(uid, installed);
+                    }
+                }
                 return Err(error);
             }
             Ok(())
@@ -168,8 +192,13 @@ impl Engine {
     pub async fn clear_config(&self, uid: u16) -> io::Result<()> {
         let inner = Arc::clone(&self.inner);
         let store = self.store.clone();
+        let routing_enabled = self.routing_enabled;
         tokio::task::spawn_blocking(move || {
             let mut inner = lock_inner(&inner)?;
+            if routing_enabled && inner.kill_switch_bypass.contains_key(&uid) {
+                routing::disable(uid)?;
+                inner.kill_switch_bypass.remove(&uid);
+            }
             let previous = inner.configs.remove(&uid);
             if let Err(error) = reconcile(&mut inner)
                 .and_then(|()| store.save(&inner.configs, &inner.destination_policies))
@@ -190,6 +219,46 @@ impl Engine {
         lock_inner(&self.inner)
             .ok()
             .and_then(|inner| inner.configs.get(&uid).cloned())
+    }
+
+    pub async fn set_kill_switch_bypass(
+        &self,
+        uid: u16,
+        enabled: bool,
+        routes: Vec<PhysicalRoute>,
+    ) -> io::Result<()> {
+        let inner = Arc::clone(&self.inner);
+        let routing_enabled = self.routing_enabled;
+        tokio::task::spawn_blocking(move || {
+            let mut inner = lock_inner(&inner)?;
+            if !routing_enabled {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "kernel routing is disabled for this engine",
+                ));
+            }
+            if enabled && !inner.configs.get(&uid).is_some_and(SplitConfig::has_rules) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "kill-switch bypass requires an active split-tunneling policy",
+                ));
+            }
+            if enabled {
+                if inner.kill_switch_bypass.get(&uid) == Some(&routes) {
+                    return Ok(());
+                }
+                let installed = routing::enable(uid, &routes)?;
+                inner.kill_switch_bypass.insert(uid, installed);
+            } else if inner.kill_switch_bypass.remove(&uid).is_some() {
+                routing::disable(uid)?;
+            } else {
+                // Also remove stale state left by an unclean service exit.
+                routing::disable(uid)?;
+            }
+            Ok(())
+        })
+        .await
+        .map_err(join_error)?
     }
 
     pub async fn set_destination_policy(&self, uid: u16, ranges: Vec<String>) -> io::Result<()> {
@@ -267,6 +336,13 @@ impl Drop for Engine {
     fn drop(&mut self) {
         self.event_task.abort();
         self.reconcile_task.abort();
+        if self.routing_enabled {
+            if let Ok(inner) = self.inner.lock() {
+                for uid in inner.kill_switch_bypass.keys().copied() {
+                    let _ = routing::disable(uid);
+                }
+            }
+        }
     }
 }
 

@@ -1,5 +1,5 @@
 pkgname=proton-vpn-omarchy
-pkgver=0.8.1
+pkgver=0.8.2
 pkgrel=1
 pkgdesc="Native Proton VPN backend and Rust split tunneling service for Omarchy Quattro"
 url="https://github.com/48hoursnonstop/proton-vpn-omarchy-core"
@@ -8,6 +8,7 @@ license=('GPL-3.0-or-later')
 provides=('proton-vpn-daemon=0.13.8')
 conflicts=('proton-vpn-daemon')
 depends=(
+  'iproute2'
   'networkmanager'
   'networkmanager-vpn-plugin-openvpn'
   'openvpn'

@@ -256,6 +256,7 @@ impl StoreHandle {
             "onboarding.complete" => self.mutate(|data| complete_onboarding(data, &params)),
             "preferences.set" => self.mutate(|data| set_preferences(data, &params)),
             "profiles.save" => self.mutate(|data| save_profile(data, &params)),
+            "profiles.duplicate" => self.mutate(|data| duplicate_profile(data, &params)),
             "profiles.delete" => self.mutate(|data| delete_profile(data, &params)),
             "excluded_locations.get" => {
                 let inner = self.lock();
@@ -509,6 +510,71 @@ fn save_profile(data: &mut StoreFile, params: &Value) -> BackendResult {
         account.profiles.push(value.clone());
     }
     Ok(json!({ "profile": value }))
+}
+
+fn duplicate_profile(data: &mut StoreFile, params: &Value) -> BackendResult {
+    let object = object_params(params)?;
+    let source_id = required_string(object, "id", 128)?;
+    let account = account_mut(data);
+    if account.profiles.len() >= MAX_PROFILES {
+        return Err(BackendError::new(
+            "profile_limit_reached",
+            "Maximum profile count reached",
+        ));
+    }
+
+    let source = account
+        .profiles
+        .iter()
+        .find(|value| value.get("id").and_then(Value::as_str) == Some(source_id.as_str()))
+        .and_then(Value::as_object)
+        .cloned()
+        .ok_or_else(|| BackendError::new("profile_not_found", "Profile was not found"))?;
+    let mut duplicate = source;
+    duplicate.remove("id");
+    duplicate.remove("createdAtMs");
+    duplicate.remove("updatedAtMs");
+
+    let requested_name = string_value(object.get("name"), 60, true)?;
+    if requested_name.is_empty() {
+        let source_name = required_string(&duplicate, "name", 60)?;
+        duplicate.insert(
+            "name".into(),
+            Value::String(copy_name(&source_name, &account.profiles)),
+        );
+    } else {
+        duplicate.insert("name".into(), Value::String(requested_name));
+    }
+
+    let id = unique_id("profile", &account.profiles);
+    let profile = Value::Object(normalize_profile(&duplicate, None, &id)?);
+    account.profiles.push(profile.clone());
+    Ok(json!({ "profile": profile, "source_id": source_id }))
+}
+
+fn copy_name(source: &str, profiles: &[Value]) -> String {
+    for sequence in 1..=MAX_PROFILES + 1 {
+        let suffix = if sequence == 1 {
+            " copy".to_owned()
+        } else {
+            format!(" copy {sequence}")
+        };
+        let keep = 60_usize.saturating_sub(suffix.chars().count());
+        let candidate = format!(
+            "{}{}",
+            source.chars().take(keep).collect::<String>(),
+            suffix
+        );
+        if !profiles.iter().any(|profile| {
+            profile
+                .get("name")
+                .and_then(Value::as_str)
+                .is_some_and(|name| name.eq_ignore_ascii_case(&candidate))
+        }) {
+            return candidate;
+        }
+    }
+    source.chars().take(60).collect()
 }
 
 fn delete_profile(data: &mut StoreFile, params: &Value) -> BackendResult {
@@ -1763,5 +1829,57 @@ mod tests {
 
         assert_eq!(error.code, "profile_not_found");
         assert!(account_ref(&data).recents.is_empty());
+    }
+
+    #[test]
+    fn duplicating_profile_creates_a_new_identity_and_preserves_settings() {
+        let mut data = StoreFile::default();
+        let saved = save_profile(
+            &mut data,
+            &json!({
+                "profile": {
+                    "name": "Streaming",
+                    "targetKind": "country",
+                    "countryCode": "ch",
+                    "profileProtocol": "protun-tls",
+                    "profileNetShieldEnabled": true,
+                    "profileNetShieldLevel": 2,
+                    "profileNatType": "strict",
+                    "profilePortForwardingEnabled": true
+                }
+            }),
+        )
+        .expect("save source profile");
+        let source = saved.get("profile").unwrap();
+        let source_id = source.get("id").and_then(Value::as_str).unwrap();
+        let source_created = source.get("createdAtMs").cloned().unwrap();
+
+        let copied = duplicate_profile(
+            &mut data,
+            &json!({ "id": source_id, "name": "Streaming copy" }),
+        )
+        .expect("duplicate profile");
+        let copied = copied.get("profile").unwrap();
+        assert_ne!(copied.get("id"), source.get("id"));
+        assert_eq!(copied.get("name"), Some(&json!("Streaming copy")));
+        assert_eq!(copied.get("countryCode"), Some(&json!("CH")));
+        assert_eq!(copied.get("profileProtocol"), Some(&json!("protun-tls")));
+        assert_eq!(
+            copied.get("profilePortForwardingEnabled"),
+            Some(&json!(true))
+        );
+        assert!(copied.get("createdAtMs").is_some());
+        assert_eq!(account_ref(&data).profiles.len(), 2);
+        assert_eq!(source.get("createdAtMs"), Some(&source_created));
+
+        let generated = duplicate_profile(&mut data, &json!({ "id": source_id }))
+            .expect("duplicate profile with generated name");
+        assert_eq!(
+            generated
+                .get("profile")
+                .and_then(|profile| profile.get("name")),
+            Some(&json!("Streaming copy 2"))
+        );
+        assert_eq!(account_ref(&data).profiles.len(), 3);
     }
 }
