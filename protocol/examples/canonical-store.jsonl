@@ -1,0 +1,6 @@
+{"v":1,"id":"30","type":"request","method":"store.get","params":{}}
+{"v":1,"id":"31","type":"request","method":"onboarding.complete","params":{"locale":"es-MX","start_with_omarchy":true,"auto_connect":false}}
+{"v":1,"id":"32","type":"request","method":"profiles.list","params":{"offset":0,"limit":50}}
+{"v":1,"id":"33","type":"request","method":"profiles.save","params":{"profile":{"name":"México rápido","targetKind":"country","countryCode":"MX","countryName":"Mexico","profileProtocol":"smart","profileNetShieldEnabled":true,"profileNetShieldLevel":2}}}
+{"v":1,"id":"34","type":"request","method":"default_connection.set","params":{"selection":{"type":"fastest"}}}
+{"v":1,"id":"35","type":"request","method":"connection.resolve","params":{}}

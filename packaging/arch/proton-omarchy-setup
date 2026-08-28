@@ -1,0 +1,202 @@
+#!/usr/bin/bash
+set -euo pipefail
+
+PLUGIN_ID="proton.omarchy"
+PLUGIN_SOURCE="${PROTON_OMARCHY_PLUGIN_SOURCE:-/usr/share/proton-vpn-omarchy/plugin}"
+SERVICE="proton-omarchy-agent.service"
+SOCKET="proton-omarchy-agent.socket"
+CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
+LIFECYCLE_FILE="$CONFIG_HOME/proton-vpn-omarchy/lifecycle.json"
+PLUGIN_PARENT="$CONFIG_HOME/omarchy/plugins"
+PLUGIN_LINK="$PLUGIN_PARENT/$PLUGIN_ID"
+
+die() {
+  printf 'proton-omarchy-setup: %s\n' "$*" >&2
+  exit 1
+}
+
+require_user() {
+  if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
+    die "run this command as the Omarchy desktop user, not as root"
+  fi
+}
+
+require_install() {
+  command -v systemctl >/dev/null || die "systemctl is required"
+}
+
+quattro_plugin_available() {
+  [[ -d "$PLUGIN_SOURCE" ]] &&
+    command -v quickshell >/dev/null 2>&1 &&
+    command -v omarchy >/dev/null 2>&1 &&
+    omarchy plugin list >/dev/null 2>&1
+}
+
+install_plugin() {
+  if ! quattro_plugin_available; then
+    die "Omarchy Quattro 4.x plugin support is required"
+  fi
+
+  omarchy plugin validate "$PLUGIN_SOURCE"
+  install_plugin_link
+  rescan_plugin
+  omarchy plugin enable "$PLUGIN_ID"
+  printf 'Omarchy Quattro plugin enabled.\n'
+}
+
+configure_agent_units() {
+  local refresh="${1:-false}"
+  systemctl --user daemon-reload
+  systemctl --user enable --now "$SOCKET"
+
+  if lifecycle_disables_autostart; then
+    systemctl --user disable --now "$SERVICE" >/dev/null 2>&1 || true
+  elif [[ "$refresh" == "true" ]] &&
+       systemctl --user is-active "$SERVICE" >/dev/null 2>&1; then
+    systemctl --user enable "$SERVICE" >/dev/null
+    systemctl --user restart "$SERVICE"
+  else
+    systemctl --user enable --now "$SERVICE"
+  fi
+}
+
+rescan_plugin() {
+  if command -v omarchy-shell >/dev/null; then
+    omarchy-shell shell rescanPlugins >/dev/null 2>&1 || true
+  fi
+}
+
+install_plugin_link() {
+  mkdir -p "$PLUGIN_PARENT"
+
+  if [[ -L "$PLUGIN_LINK" ]]; then
+    local current
+    current="$(readlink -f "$PLUGIN_LINK" 2>/dev/null || true)"
+    local expected
+    expected="$(readlink -f "$PLUGIN_SOURCE")"
+    [[ "$current" == "$expected" ]] ||
+      die "$PLUGIN_LINK already points somewhere else: $current"
+  elif [[ -e "$PLUGIN_LINK" ]]; then
+    die "$PLUGIN_LINK already exists and is not the package-managed symlink"
+  else
+    ln -s "$PLUGIN_SOURCE" "$PLUGIN_LINK"
+  fi
+}
+
+install_all() {
+  require_user
+  require_install
+
+  install_plugin
+  configure_agent_units false
+
+  printf 'Installed and enabled Proton VPN for Omarchy.\n'
+}
+
+install_backend() {
+  require_user
+  require_install
+
+  configure_agent_units false
+  printf 'Enabled the Proton VPN user agent and on-demand socket.\n'
+  printf 'Install the Git-managed UI with:\n'
+  printf '  omarchy plugin add https://github.com/48hoursnonstop/proton-vpn-omarchy.git --enable\n'
+}
+
+refresh_all() {
+  require_user
+  require_install
+
+  quattro_plugin_available || die "Omarchy Quattro 4.x plugin support is required"
+  omarchy plugin validate "$PLUGIN_SOURCE"
+  install_plugin_link
+  rescan_plugin
+  configure_agent_units true
+
+  printf 'Refreshed Proton VPN for Omarchy after package upgrade.\n'
+}
+
+uninstall_user_state() {
+  require_user
+
+  if command -v omarchy >/dev/null 2>&1; then
+    omarchy plugin disable "$PLUGIN_ID" >/dev/null 2>&1 || true
+  fi
+
+  systemctl --user disable --now "$SERVICE" >/dev/null 2>&1 || true
+  systemctl --user disable --now "$SOCKET" >/dev/null 2>&1 || true
+
+  if [[ -L "$PLUGIN_LINK" ]]; then
+    local current
+    current="$(readlink -f "$PLUGIN_LINK" 2>/dev/null || true)"
+    local expected
+    expected="$(readlink -f "$PLUGIN_SOURCE" 2>/dev/null || true)"
+    if [[ -n "$expected" && "$current" == "$expected" ]]; then
+      rm "$PLUGIN_LINK"
+    elif [[ -z "$expected" ]]; then
+      # Package may already be removed; only remove the known package symlink.
+      local raw
+      raw="$(readlink "$PLUGIN_LINK" 2>/dev/null || true)"
+      [[ "$raw" == "$PLUGIN_SOURCE" ]] && rm "$PLUGIN_LINK"
+    fi
+  fi
+
+  rescan_plugin
+  printf 'Disabled user integration for Proton VPN for Omarchy.\n'
+}
+
+show_status() {
+  require_user
+  printf 'Plugin path: %s\n' "$PLUGIN_LINK"
+  if [[ -L "$PLUGIN_LINK" ]]; then
+    printf 'Plugin link: %s\n' "$(readlink "$PLUGIN_LINK")"
+  else
+    printf 'Plugin link: not installed\n'
+  fi
+
+  printf 'Agent enabled: '
+  systemctl --user is-enabled "$SERVICE" 2>/dev/null || true
+  printf 'Agent active: '
+  systemctl --user is-active "$SERVICE" 2>/dev/null || true
+  printf 'On-demand socket enabled: '
+  systemctl --user is-enabled "$SOCKET" 2>/dev/null || true
+  printf 'On-demand socket active: '
+  systemctl --user is-active "$SOCKET" 2>/dev/null || true
+
+  if quattro_plugin_available; then
+    printf '\nOmarchy Quattro plugin entry:\n'
+    omarchy plugin list 2>/dev/null | grep -F "$PLUGIN_ID" || printf 'not discovered\n'
+  else
+    printf '\nQuickshell/Quattro plugin integration: unavailable\n'
+  fi
+}
+
+lifecycle_disables_autostart() {
+  [[ -f "$LIFECYCLE_FILE" ]] &&
+    grep -Eq '"start_with_omarchy"[[:space:]]*:[[:space:]]*false' "$LIFECYCLE_FILE"
+}
+
+usage() {
+  cat <<'EOF'
+Usage: proton-omarchy-setup <command>
+
+Commands:
+  install    Validate + link the plugin and configure its user agent/socket.
+  backend    Configure only the agent/socket for a Git-managed plugin checkout.
+  refresh    Rescan plugin files and preserve the saved auto-start preference.
+  uninstall  Disable the plugin/agent and remove only the package-managed user symlink.
+  status     Show plugin link and user-agent status.
+
+Run this helper as the Omarchy desktop user. It never needs sudo.
+EOF
+}
+
+case "${1:-}" in
+  install) install_all ;;
+  backend) install_backend ;;
+  refresh) refresh_all ;;
+  uninstall) uninstall_user_state ;;
+  status) show_status ;;
+  -h|--help|help|"") usage ;;
+  *) usage >&2; exit 2 ;;
+esac

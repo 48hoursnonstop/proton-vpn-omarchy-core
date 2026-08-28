@@ -1,0 +1,1 @@
+{"v":1,"id":"22","type":"request","method":"dns.set","params":{"enabled":true,"servers":["1.1.1.1"]}}

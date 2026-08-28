@@ -1,0 +1,1 @@
+{"v":1,"id":"41","type":"request","method":"split_tunneling.set","params":{"enabled":true,"mode":"standard","standard":{"app_paths":["/usr/bin/firefox"]},"inverse":{"app_paths":[]}}}

@@ -1,0 +1,2 @@
+{"v":1,"id":"1","type":"request","method":"hello","params":{"client":"report-issue-example","client_version":"0.8.0-56-WIP"}}
+{"v":1,"id":"2","type":"request","method":"report_issue.submit","params":{"category":"Something else","email":"user@example.com","fields":{"What went wrong?":"Describe the issue"},"include_logs":true}}

@@ -1,0 +1,11 @@
+[Trigger]
+Operation = Install
+Operation = Upgrade
+Type = Package
+Target = proton-vpn-omarchy
+Target = python-proton-vpn-api-core
+
+[Action]
+Description = Keeping ProTun compatible with private NetworkManager profiles...
+When = PostTransaction
+Exec = /usr/lib/proton-vpn-omarchy/proton-omarchy-protun-metadata

@@ -1,0 +1,52 @@
+{
+  "checkpoint": "0.8.0-plugin-first-release",
+  "audited_at": "2026-08-26",
+  "target": {
+    "omarchy": "4.x",
+    "python-proton-vpn-api-core": "5.5.11-1",
+    "proton-vpn-daemon_reference": "0.13.8-1 (replaced at runtime)",
+    "python-proton-core": "0.7.4-1",
+    "windows_reference_commit": "4d9ac60d1db5d3f2908498470a9d1646723afcfd",
+    "protun_reference_commit": "1829b00a27071ae3a3ad3f6c791add88c5c6eaec",
+    "local_agent_reference_commit": "74ec6f4f093805d766f11f9ef522bf1120591058"
+  },
+  "native_backend": {
+    "version": "0.8.0/rust-v2",
+    "only_runtime_backend": true,
+    "legacy_python_bridge": "removed from runtime and package",
+    "tunnel_engines": {
+      "protun": "official NetworkManager ProTun service",
+      "openvpn": "official NetworkManager OpenVPN service",
+      "split_tunneling": "project-owned Rust D-Bus/netlink/eBPF service, wire-compatible with Proton daemon 0.13.8"
+    }
+  },
+  "implemented_from_official_contracts": {
+    "authentication": "SRP, TOTP, FIDO2, organization SSO and Human Verification",
+    "protocols": "Smart, ProTun UDP/TCP/TLS-Stealth and OpenVPN UDP/TCP when advertised",
+    "protection": "standard/advanced Kill Switch, NetShield, VPN Accelerator, Moderate NAT, port forwarding, IPv6 and IPv6 leak protection",
+    "anti_censorship": "Alternative Routing through the official Proton DoH naming scheme and Windows alternative-host TLS pins",
+    "connection_observation": "traffic counters, Local Agent NetShield counters, forwarded port and P2P restriction reason 86153",
+    "product_data": "profiles, recents, favorites, Default Connection, excluded locations and Connect and Go/private launch",
+    "support": "connection feedback statistical events, report issue, bounded diagnostics, account and upgrade handoff"
+  },
+  "installed_source_authority": {
+    "proton/session/transports/alternativerouting.py": "c063b2a2b675174ef794638743df34f8f05b1da4f4a8397d115652b7b3b85cca",
+    "proton/vpn/daemon/split_tunneling/split_tunneling.py": "850473c208250e27bf90ca47a04eed249cbbe3e29c8ec1a39361c0b9b543a9e2",
+    "proton/vpn/daemon/split_tunneling/service.py": "954ce44d8fb0d0af6d16cbfe5ecface1682474c3d1d4f002011e2c635b507d95",
+    "proton/vpn/backend/networkmanager/protocol/protun/protun.py": "17fc3010e1dda1b57d826a730e4f4b6dcbd2b21ac5c1f4c5d502db93d251cd51"
+  },
+  "project_extensions": {
+    "split_tunneling_ip_ranges": "IPv4/IPv6 hosts and CIDRs are canonicalized, persisted and enforced with UID-scoped LPM maps at connect/sendmsg hooks.",
+    "local_area_network_access_policy": "Private, unique-local and link-local destinations use the same Proton bypass mark through a separate authenticated policy map.",
+    "local_dns_access_policy": "Only exact private/link-local physical resolvers plus mDNS/LLMNR multicast destinations bypass; public resolvers are never imported from the physical link."
+  },
+  "blocked_upstream": {},
+  "platform_policy": {
+    "updates": "Arch/Omarchy package lifecycle replaces the Windows in-app updater",
+    "openvpn_adapter": "NetworkManager uses a Linux TUN interface; Windows TUN/TAP driver selection is not portable",
+    "protocol_visibility": "Only exact installed/advertised backends are selectable",
+    "qml_network_privilege": false,
+    "embedded_webview": false,
+    "tray": false
+  }
+}

@@ -1,0 +1,57 @@
+#!/usr/bin/bash
+set -euo pipefail
+
+descriptor=${PROTON_OMARCHY_PROTUN_DESCRIPTOR:-/usr/lib/NetworkManager/VPN/nm-protun.name}
+
+# NetworkManager 1.56+ refuses private VPN profiles unless the service declares
+# that it does not read arbitrary user files (or checks ownership itself).
+# ProTun receives its key material through D-Bus, so this declaration is the
+# accurate upstream-compatible value. Keep the repair narrow because the file
+# is owned by python-proton-vpn-api-core until Proton ships the field itself.
+[[ -f $descriptor ]] || exit 0
+grep -Fxq 'service=org.freedesktop.NetworkManager.protun' "$descriptor" || {
+  printf 'proton-omarchy-protun-metadata: refusing unknown descriptor: %s\n' "$descriptor" >&2
+  exit 1
+}
+grep -Fxq 'program=/usr/libexec/nm-protun-service' "$descriptor" || {
+  printf 'proton-omarchy-protun-metadata: refusing unknown ProTun program\n' >&2
+  exit 1
+}
+grep -Fxq 'supports-safe-private-file-access=true' "$descriptor" && exit 0
+
+temporary=$(mktemp "${descriptor}.XXXXXX")
+trap 'rm -f "$temporary"' EXIT
+awk '
+  BEGIN { in_vpn = 0; inserted = 0 }
+  /^\[VPN Connection\]$/ { in_vpn = 1 }
+  in_vpn && /^supports-safe-private-file-access=/ {
+    if (!inserted) print "supports-safe-private-file-access=true"
+    inserted = 1
+    next
+  }
+  in_vpn && /^supports-multiple-connections=/ {
+    print
+    if (!inserted) print "supports-safe-private-file-access=true"
+    inserted = 1
+    next
+  }
+  in_vpn && /^\[/ {
+    if (!inserted) print "supports-safe-private-file-access=true"
+    inserted = 1
+    in_vpn = 0
+  }
+  { print }
+  END {
+    if (in_vpn && !inserted) print "supports-safe-private-file-access=true"
+  }
+' "$descriptor" >"$temporary"
+
+grep -Fxq 'supports-safe-private-file-access=true' "$temporary" || {
+  printf 'proton-omarchy-protun-metadata: failed to update descriptor\n' >&2
+  exit 1
+}
+install -m 0644 "$temporary" "$descriptor"
+
+if systemctl is-active --quiet NetworkManager.service 2>/dev/null; then
+  systemctl reload NetworkManager.service || true
+fi

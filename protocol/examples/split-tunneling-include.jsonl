@@ -1,0 +1,1 @@
+{"v":1,"id":"42","type":"request","method":"split_tunneling.set","params":{"enabled":true,"mode":"inverse","standard":{"app_paths":[]},"inverse":{"app_paths":["/usr/bin/steam"]}}}

@@ -1,0 +1,35 @@
+[Unit]
+Description=Proton VPN split tunneling service (Rust)
+After=network.target
+
+[Service]
+Type=dbus
+BusName=me.proton.vpn.split_tunneling
+ExecStart=/usr/lib/proton-vpn-omarchy/proton-omarchy-splitd
+Restart=on-failure
+RestartSec=1
+TimeoutStartSec=30
+User=root
+UMask=0077
+StateDirectory=proton-vpn-omarchy
+StateDirectoryMode=0700
+NoNewPrivileges=true
+CapabilityBoundingSet=CAP_BPF CAP_NET_ADMIN CAP_PERFMON CAP_DAC_READ_SEARCH
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictRealtime=true
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
+SystemCallFilter=@system-service bpf
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target

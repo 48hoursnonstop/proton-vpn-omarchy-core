@@ -1,0 +1,11 @@
+[Unit]
+Description=Proton VPN for Omarchy on-demand agent socket
+
+[Socket]
+ListenStream=%t/proton-omarchy.sock
+Service=proton-omarchy-agent.service
+SocketMode=0600
+RemoveOnStop=true
+
+[Install]
+WantedBy=sockets.target

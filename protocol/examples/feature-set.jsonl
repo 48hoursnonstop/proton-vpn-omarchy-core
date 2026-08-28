@@ -1,0 +1,2 @@
+{"v":1,"id":"20","type":"request","method":"feature.set","params":{"feature":"netshield","value":2}}
+{"v":1,"id":"21","type":"request","method":"feature.set","params":{"feature":"vpn_accelerator","value":false}}

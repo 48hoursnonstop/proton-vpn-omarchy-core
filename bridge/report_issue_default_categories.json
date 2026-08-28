@@ -1,0 +1,230 @@
+{
+  "categories": [
+    {
+      "label": "Browsing speed",
+      "submit_label": "Browsing speed",
+      "suggestions": [
+        {
+          "text": "Turn off Secure Core. It can sometimes slow down your connection.",
+          "link": "https://protonvpn.com/support/secure-core-vpn"
+        },
+        {
+          "text": "Use another VPN protocol.",
+          "link": "https://protonvpn.com/support/how-to-change-vpn-protocols"
+        },
+        {
+          "text": "Try a different server. Servers in nearby countries often have faster connection speeds.",
+          "link": ""
+        }
+      ],
+      "input_fields": [
+        {
+          "label": "Network type",
+          "submit_label": "Network type",
+          "type": "TextSingleLine",
+          "placeholder": "Home WiFi, School Wi-Fi, Work, Public Wi-Fi",
+          "is_mandatory": true
+        },
+        {
+          "label": "What are you trying to do?",
+          "submit_label": "What are you trying to do?",
+          "type": "TextMultiLine",
+          "placeholder": "Example: browse a website, upload pictures, download a PDF",
+          "is_mandatory": true
+        },
+        {
+          "label": "What is the speed you are getting?",
+          "submit_label": "What is the speed you are getting?",
+          "type": "TextSingleLine",
+          "placeholder": "Example: 20 KB in download",
+          "is_mandatory": true
+        },
+        {
+          "label": "What is your connection speed without VPN?",
+          "submit_label": "What is your connection speed without VPN?",
+          "type": "TextSingleLine",
+          "placeholder": "Example: 10 MB in download",
+          "is_mandatory": true
+        }
+      ]
+    },
+    {
+      "label": "Connecting to VPN",
+      "submit_label": "Connecting to VPN",
+      "suggestions": [
+        {
+          "text": "Try a different server. Servers in nearby countries often have faster connection speeds.",
+          "link": ""
+        },
+        {
+          "text": "Switch to another protocol from the settings.",
+          "link": "https://protonvpn.com/support/how-to-change-vpn-protocols"
+        },
+        {
+          "text": "Turn off any antivirus or firewall software. They could be interfering with your VPN connection.",
+          "link": ""
+        }
+      ],
+      "input_fields": [
+        {
+          "label": "Network type",
+          "submit_label": "Network type",
+          "type": "TextSingleLine",
+          "placeholder": "Home WiFi, School Wi-Fi, Work, Public Wi-Fi",
+          "is_mandatory": true
+        },
+        {
+          "label": "What steps have you taken to try to connect to VPN?",
+          "submit_label": "What steps have you taken to try to connect to VPN?",
+          "type": "TextMultiLine",
+          "placeholder": "",
+          "is_mandatory": true
+        },
+        {
+          "label": "Have you tried any quick fixes? If so, which ones?",
+          "submit_label": "Have you tried any quick fixes? If so, which ones?",
+          "type": "TextMultiLine",
+          "placeholder": "",
+          "is_mandatory": true
+        }
+      ]
+    },
+    {
+      "label": "Weak or unstable connection",
+      "submit_label": "Weak or unstable connection",
+      "suggestions": [
+        {
+          "text": "Try a different server. Servers in nearby countries often have faster connection speeds.",
+          "link": ""
+        },
+        {
+          "text": "Use another VPN protocol.",
+          "link": "https://protonvpn.com/support/how-to-change-vpn-protocols"
+        },
+        {
+          "text": "Turn off any antivirus or firewall software. They could be interfering with your VPN connection.",
+          "link": ""
+        }
+      ],
+      "input_fields": [
+        {
+          "label": "Network type",
+          "submit_label": "Network type",
+          "type": "TextSingleLine",
+          "placeholder": "Home WiFi, School Wi-Fi, Work, Public Wi-Fi",
+          "is_mandatory": true
+        },
+        {
+          "label": "Did you get an error message? If so, what did it say?",
+          "submit_label": "Did you get an error message? If so, what did it say?",
+          "type": "TextMultiLine",
+          "placeholder": "",
+          "is_mandatory": true
+        },
+        {
+          "label": "What have you tried already from the suggestions?",
+          "submit_label": "What have you tried already from the suggestions?",
+          "type": "TextMultiLine",
+          "placeholder": "",
+          "is_mandatory": true
+        }
+      ]
+    },
+    {
+      "label": "Using the app",
+      "submit_label": "Using the app",
+      "suggestions": [
+        {
+          "text": "Log out and log back in.",
+          "link": ""
+        },
+        {
+          "text": "Restart the app.",
+          "link": ""
+        }
+      ],
+      "input_fields": [
+        {
+          "label": "What went wrong?",
+          "submit_label": "What went wrong?",
+          "type": "TextMultiLine",
+          "placeholder": "",
+          "is_mandatory": true
+        },
+        {
+          "label": "What are the exact steps you performed? Include any error you experienced.",
+          "submit_label": "What are the exact steps you performed? Include any error you experienced.",
+          "type": "TextMultiLine",
+          "placeholder": "",
+          "is_mandatory": true
+        },
+        {
+          "label": "Have you tried any quick fixes? If so, which ones?",
+          "submit_label": "Have you tried any quick fixes? If so, which ones?",
+          "type": "TextMultiLine",
+          "placeholder": "",
+          "is_mandatory": true
+        }
+      ]
+    },
+    {
+      "label": "Streaming",
+      "submit_label": "Streaming",
+      "suggestions": [
+        {
+          "text": "Try a different PLUS server. Just so you know, streaming is only available on a PLUS subscription.",
+          "link": ""
+        },
+        {
+          "text": "Clear your cache. You can do this in your browser settings.",
+          "link": "https://protonvpn.com/support/clear-browser-cache-cookies"
+        },
+        {
+          "text": "Try a different web browser.",
+          "link": ""
+        },
+        {
+          "text": "Turn off any ad blockers or proxies. If you use NetShield, set it to “don’t block”.",
+          "link": ""
+        }
+      ],
+      "input_fields": [
+        {
+          "label": "Which streaming service are you trying to use?",
+          "submit_label": "Which streaming service are you trying to use?",
+          "type": "TextMultiLine",
+          "placeholder": "Netflix, Disney+, HBO",
+          "is_mandatory": true
+        },
+        {
+          "label": "Are you using a custom DNS, proxy, or NetShield?",
+          "submit_label": "Are you using a custom DNS, proxy, or NetShield?",
+          "type": "TextMultiLine",
+          "placeholder": "",
+          "is_mandatory": true
+        },
+        {
+          "label": "What went wrong? Include any error messages you received.",
+          "submit_label": "What went wrong? Include any error messages you received.",
+          "type": "TextMultiLine",
+          "placeholder": "",
+          "is_mandatory": true
+        }
+      ]
+    },
+    {
+      "label": "Something else",
+      "submit_label": "Something else",
+      "suggestions": [],
+      "input_fields": [
+        {
+          "label": "What went wrong?",
+          "submit_label": "What went wrong?",
+          "type": "TextMultiLine",
+          "placeholder": "Please describe the problem in as much detail as you can. If there was an error message, let us know what it said.",
+          "is_mandatory": true
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,22 @@
+post_install() {
+  systemctl daemon-reload
+  systemctl enable --now proton.VPN.service
+  echo ":: Proton VPN for Omarchy Quattro is installed."
+  echo ":: Choose one user integration method as your desktop user:"
+  echo "   Package-managed UI: proton-omarchy-setup install"
+  echo "   Git-managed UI:     proton-omarchy-setup backend"
+}
+
+post_upgrade() {
+  systemctl daemon-reload
+  systemctl restart proton.VPN.service
+  echo ":: Proton VPN for Omarchy Quattro was upgraded."
+  echo ":: Package-managed UI users should run: proton-omarchy-setup refresh"
+}
+
+pre_remove() {
+  systemctl disable --now proton.VPN.service
+  echo ":: Before removing the package, user integration can be removed with:"
+  echo "   proton-omarchy-setup uninstall"
+  echo ":: Pacman intentionally does not modify users' ~/.config directories."
+}

@@ -1,0 +1,2 @@
+{"v":1,"id":"1","type":"request","method":"hello","params":{"client":"plugin","client_version":"0.8.0","client_instance_id":"plugin-shell-7f3a"}}
+{"type":"response","v":1,"id":"1","ok":true,"result":{"protocol_version":1,"server":"proton-omarchy-agent","mock_backend":false,"backend":"proton_linux","client_instance_id":"plugin-shell-7f3a"}}

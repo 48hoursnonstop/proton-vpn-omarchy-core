@@ -1,0 +1,36 @@
+[package]
+name = "proton-omarchy-agent"
+version = "0.8.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+proton-omarchy-protocol = { path = "../protocol" }
+authenticator = { version = "0.4.1", default-features = false, features = ["crypto_openssl"] }
+base64 = "0.22"
+data-encoding = "2.6"
+ed25519-dalek = { version = "2.1", features = ["pkcs8", "pem", "rand_core"] }
+futures-util.workspace = true
+isocountry = "0.3"
+ipnet = "2.12"
+keyring = { version = "3.6", default-features = false, features = ["sync-secret-service", "crypto-rust"] }
+libc = "0.2"
+local-agent-rs = { path = "../vendor/local-agent-rs" }
+nmdbus = "1.50"
+pkcs8 = { version = "0.10.2", features = ["encryption", "pem"] }
+proton-srp = "0.8.2"
+rand = "0.9"
+rand_core = { version = "0.6", features = ["getrandom"] }
+reqwest = { version = "0.12", default-features = false, features = ["cookies", "json", "multipart", "rustls-tls"] }
+serde.workspace = true
+serde_json.workspace = true
+sha2 = "0.10"
+shell-words = "1.1"
+tokio.workspace = true
+tokio-util.workspace = true
+tokio-tungstenite = { version = "0.28", default-features = false, features = ["connect", "handshake"] }
+url = "2"
+uuid = { version = "1", features = ["v4"] }
+x509-parser = "0.18"
+zeroize = { version = "1", features = ["derive"] }

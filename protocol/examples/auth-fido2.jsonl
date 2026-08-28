@@ -1,0 +1,4 @@
+{"v":1,"id":"20","type":"request","method":"account.authenticate_fido2","params":{}}
+{"type":"event","v":1,"event":"state.changed","data":{"revision":11,"operations":{"active":[{"id":"op-0000000000000004","initiator_client_instance_id":"plugin-shell-7f3a","domain":"auth_session","kind":"account.authenticate_fido2","state":"running","stage":"auth.security_key_pin_required","started_at_unix_ms":1787533200000,"updated_at_unix_ms":1787533200300,"finished_at_unix_ms":null,"cancelable":true,"error":null}],"recent":[]}}}
+{"v":1,"id":"21","type":"request","method":"account.submit_fido2_pin","params":{"pin":"<redacted>"}}
+{"v":1,"id":"22","type":"request","method":"account.cancel_fido2","params":{}}
