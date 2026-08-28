@@ -34,7 +34,9 @@ while IFS= read -r -d '' path; do
 done < <(git -C "$repo_root" ls-files -z)
 
 mkdir -p "$(dirname "$output")"
-tar --sort=name --format=posix --mtime="@$epoch" \
+tar --sort=name --format=posix \
+  --pax-option=delete=atime,delete=ctime \
+  --mtime="@$epoch" \
   --owner=0 --group=0 --numeric-owner \
   -C "$staging" -cf - "$archive_root" | gzip -n >"$output"
 printf '%s\n' "$output"

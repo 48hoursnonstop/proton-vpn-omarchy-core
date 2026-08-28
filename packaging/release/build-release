@@ -60,6 +60,13 @@ mkdir -p -- "$output_dir"
 SOURCE_DATE_EPOCH="$source_epoch" \
   "$repo_root/scripts/make-source-archive" "$version" "$output_dir/$source_name" \
   >/dev/null
+SOURCE_DATE_EPOCH="$source_epoch" \
+  "$repo_root/scripts/make-source-archive" "$version" "$build_root/$source_name" \
+  >/dev/null
+cmp --silent "$output_dir/$source_name" "$build_root/$source_name" || {
+  printf 'source archive generation is not reproducible\n' >&2
+  exit 1
+}
 
 readonly actual_source_sha="$(sha256sum -- "$output_dir/$source_name")"
 [[ ${actual_source_sha%% *} == "$expected_source_sha" ]] || {
