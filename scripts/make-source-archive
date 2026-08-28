@@ -1,0 +1,40 @@
+#!/usr/bin/bash
+set -euo pipefail
+
+version="${1:-}"
+output="${2:-}"
+epoch="${SOURCE_DATE_EPOCH:-0}"
+
+[[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+  printf 'usage: SOURCE_DATE_EPOCH=<unix-seconds> %s VERSION OUTPUT\n' "$0" >&2
+  exit 2
+}
+[[ -n "$output" ]] || {
+  printf 'usage: SOURCE_DATE_EPOCH=<unix-seconds> %s VERSION OUTPUT\n' "$0" >&2
+  exit 2
+}
+[[ "$epoch" =~ ^[0-9]+$ ]] || {
+  printf 'SOURCE_DATE_EPOCH must be a non-negative integer\n' >&2
+  exit 2
+}
+
+repo_root="$(git rev-parse --show-toplevel)"
+output="$(realpath -m "$output")"
+archive_root="proton-vpn-omarchy-$version"
+staging="$(mktemp -d)"
+trap 'rm -rf -- "$staging"' EXIT
+mkdir -p "$staging/$archive_root"
+
+while IFS= read -r -d '' path; do
+  case "$path" in
+    packaging/arch/PKGBUILD|packaging/arch/.SRCINFO) continue ;;
+  esac
+  mkdir -p "$staging/$archive_root/$(dirname "$path")"
+  cp --preserve=mode "$repo_root/$path" "$staging/$archive_root/$path"
+done < <(git -C "$repo_root" ls-files -z)
+
+mkdir -p "$(dirname "$output")"
+tar --sort=name --format=posix --mtime="@$epoch" \
+  --owner=0 --group=0 --numeric-owner \
+  -C "$staging" -cf - "$archive_root" | gzip -n >"$output"
+printf '%s\n' "$output"

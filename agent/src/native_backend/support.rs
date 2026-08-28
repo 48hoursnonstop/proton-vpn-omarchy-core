@@ -4,9 +4,10 @@ use std::{collections::BTreeMap, fs, process::Command};
 
 pub const CATEGORY_ENDPOINT: &str = "/vpn/v1/featureconfig/dynamic-bug-reports";
 pub const REPORT_ENDPOINT: &str = "/core/v4/reports/bug";
-pub const REPORT_TITLE: &str = "Report from Linux app";
+pub const REPORT_TITLE: &str = "Report from Proton VPN for Omarchy (unofficial community client)";
 pub const REPORT_CLIENT: &str = "Linux GUI";
 pub const REPORT_CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+pub const COMMUNITY_REPOSITORY: &str = "https://github.com/48hoursnonstop/proton-vpn-omarchy";
 const MAX_FIELDS: usize = 32;
 const MAX_LOG_BYTES: usize = 2 * 1024 * 1024;
 const REPORT_LOG_LINES: usize = 5_000;
@@ -156,7 +157,7 @@ pub fn report_request(params: &Value) -> NativeResult<ReportRequest> {
     let include_logs = params
         .get("include_logs")
         .map(Value::as_bool)
-        .unwrap_or(Some(true))
+        .unwrap_or(Some(false))
         .ok_or_else(|| NativeError::new("invalid_params", "include_logs must be a boolean"))?;
     Ok(ReportRequest {
         category,
@@ -167,7 +168,15 @@ pub fn report_request(params: &Value) -> NativeResult<ReportRequest> {
 }
 
 pub fn report_description(request: &ReportRequest) -> String {
-    let mut lines = vec![format!("Category: {}", request.category), String::new()];
+    let mut lines = vec![
+        "Client: Proton VPN for Omarchy".to_owned(),
+        "Distribution: unofficial community client".to_owned(),
+        format!("Core version: {REPORT_CLIENT_VERSION}"),
+        format!("Repository: {COMMUNITY_REPOSITORY}"),
+        String::new(),
+        format!("Category: {}", request.category),
+        String::new(),
+    ];
     for (key, value) in &request.fields {
         if value.trim().is_empty() {
             continue;
@@ -175,6 +184,72 @@ pub fn report_description(request: &ReportRequest) -> String {
         lines.extend([key.clone(), value.clone(), String::new()]);
     }
     format!("{}\n", lines.join("\n").trim_end())
+}
+
+#[derive(Clone, Debug)]
+pub struct DiagnosticSummary<'a> {
+    pub os: &'a str,
+    pub os_version: &'a str,
+    pub backend_version: &'a str,
+    pub signed_in: bool,
+    pub catalog_loaded: bool,
+    pub client_config_loaded: bool,
+    pub tunnel_state: &'a str,
+    pub protocol: Option<&'a str>,
+    pub protocols: &'a [&'a str],
+    pub api_reachable: bool,
+    pub tls_pin_verified: bool,
+    pub log_sources_available: usize,
+    pub log_source_failures: usize,
+}
+
+pub fn diagnostic_summary(details: &DiagnosticSummary<'_>) -> String {
+    let os = if details.os_version.is_empty() {
+        details.os.to_owned()
+    } else {
+        format!("{} {}", details.os, details.os_version)
+    };
+    let protocol = details
+        .protocol
+        .filter(|value| !value.is_empty())
+        .unwrap_or("none");
+    format!(
+        concat!(
+            "Proton VPN for Omarchy diagnostics (sanitized)\n",
+            "Core: {}\n",
+            "OS: {}\n",
+            "Signed in: {}\n",
+            "Catalog loaded: {}\n",
+            "Client config loaded: {}\n",
+            "Tunnel state: {}\n",
+            "Active protocol: {}\n",
+            "Available protocols: {}\n",
+            "Proton API reachable: {}\n",
+            "TLS pin verified: {}\n",
+            "Diagnostic sources available: {}/{}\n",
+            "Raw journals: not included"
+        ),
+        details.backend_version,
+        os,
+        yes_no(details.signed_in),
+        yes_no(details.catalog_loaded),
+        yes_no(details.client_config_loaded),
+        details.tunnel_state,
+        protocol,
+        details.protocols.join(", "),
+        yes_no(details.api_reachable),
+        yes_no(details.tls_pin_verified),
+        details.log_sources_available,
+        details.log_sources_available + details.log_source_failures,
+    )
+}
+
+fn yes_no(value: bool) -> &'static str {
+    if value {
+        "yes"
+    } else {
+        "no"
+    }
 }
 
 pub fn collect_logs() -> LogCollection {
@@ -217,7 +292,7 @@ fn collect_logs_bounded(max_lines: usize) -> LogCollection {
             "SplitTunneling.log",
             &[
                 "-u",
-                "me.proton.vpn.split_tunneling",
+                "proton.VPN.service",
                 "--no-pager",
                 "--utc",
                 "--since=-1d",
@@ -355,11 +430,45 @@ mod tests {
         .expect("report request");
         assert!(!request.include_logs);
         assert!(report_description(&request).contains("Category: Using the app"));
+        assert!(report_description(&request).contains("unofficial community client"));
         assert!(report_request(&json!({
             "category": "Other",
             "email": "invalid",
             "fields": {},
         }))
         .is_err());
+    }
+
+    #[test]
+    fn reports_do_not_include_logs_without_explicit_consent() {
+        let request = report_request(&json!({
+            "category": "Other",
+            "email": "person@example.com",
+            "fields": {},
+        }))
+        .expect("report request");
+        assert!(!request.include_logs);
+    }
+
+    #[test]
+    fn diagnostic_summary_is_shareable_and_excludes_identifiers() {
+        let summary = diagnostic_summary(&DiagnosticSummary {
+            os: "arch (Hyprland)",
+            os_version: "rolling",
+            backend_version: "0.8.1/rust-v2",
+            signed_in: true,
+            catalog_loaded: true,
+            client_config_loaded: true,
+            tunnel_state: "connected",
+            protocol: Some("wireguard"),
+            protocols: &["wireguard", "openvpn-tcp"],
+            api_reachable: true,
+            tls_pin_verified: true,
+            log_sources_available: 3,
+            log_source_failures: 0,
+        });
+        assert!(summary.contains("Raw journals: not included"));
+        assert!(!summary.contains("UUID"));
+        assert!(!summary.contains("IP address"));
     }
 }

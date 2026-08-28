@@ -245,27 +245,37 @@ VPN connection. Selectors are short-lived authentication material and must not b
 
 ## Report an issue submission
 
-The frozen Windows UI serializes the selected category and dynamic field values; the official
-Proton Linux core owns the bug-report transport and Linux OS metadata. The UI request is:
+The frozen Windows UI serializes the selected category and dynamic field values. The Rust core
+sends this optional report directly to Proton's official bug-report endpoint and supplies Linux OS
+metadata. This is separate from community GitHub issues. The UI request is:
 
 ```json
 {"v":1,"id":"46","type":"request","method":"report_issue.submit","params":{"category":"Something else","email":"user@example.com","fields":{"What went wrong?":"Description"},"include_logs":true}}
 ```
 
-`include_logs=true` collects the three frozen Linux diagnostic sources: the Proton app/backend
-log, the last day of NetworkManager journal, and the split-tunneling journal. In this port the
-Python Proton bridge stderr is inherited by `proton-omarchy-agent.service`, so that user-service
-journal is the app/backend-log equivalent. Journal sources are best-effort; an unavailable source
-does not discard the user's report.
+Logs are opt-in: omitting `include_logs` is equivalent to `false`. When explicitly set to `true`,
+the core collects three bounded Linux sources: the `proton-omarchy-agent.service` user journal,
+the last day of NetworkManager journal, and the `proton.VPN.service` split-tunneling journal.
+Sources are best-effort; one unavailable source does not discard the user's report.
 
-The bridge creates `proton.vpn.session.dataclasses.BugReportForm` with truthful Linux metadata
-(`Title=Report from Linux app`, `Client=Linux GUI`) and sends it only through
-`ProtonVPNAPI.submit_bug_report()`. It never initializes `VPNConnector` and never changes VPN,
-DNS, routes, Kill Switch, or NetworkManager state.
+The report identifies itself as the unofficial Proton VPN for Omarchy community client. It sends
+the signed-in account name, entered email, current country/ISP when available, selected description,
+and the opted-in attachments directly to Proton AG. Frontends must disclose that destination and
+obtain explicit confirmation. The community issue flow never calls this method.
+
+`diagnostics.get` returns a shareable `summary` that excludes account names, IP addresses,
+connection IDs, raw API errors, and journal contents. It is intended for the community GitHub issue
+template; raw journals remain local unless the user separately opts into the official Proton report.
+
+The Rust transport uses Proton's official multipart report contract with truthful metadata
+(`Title=Report from Proton VPN for Omarchy (unofficial community client)`, `Client=Linux GUI`).
+The `Client` value is retained for Proton's Linux routing contract; the title, description and
+repository URL identify the actual community product. Submission never initializes or mutates a
+VPN connection, DNS, routes, Kill Switch, or NetworkManager state.
 
 The target validation gate sets `PROTON_OMARCHY_REPORT_ISSUE_DRY_RUN=1`. That exercises form
-validation, description serialization and diagnostic collection but intentionally skips
-`submit_bug_report()`, so automated validation can never create a customer-support ticket.
+validation, description serialization and diagnostic collection but intentionally skips the HTTP
+request, so automated validation can never create a customer-support ticket.
 
 ## Installed applications
 

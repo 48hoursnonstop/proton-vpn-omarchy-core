@@ -1,8 +1,8 @@
 pkgname=proton-vpn-omarchy
-pkgver=0.8.0
-pkgrel=3
-pkgdesc="Native Proton VPN plugin and Rust split tunneling service for Omarchy Quattro"
-url="https://github.com/48hoursnonstop/proton-vpn-omarchy"
+pkgver=0.8.1
+pkgrel=1
+pkgdesc="Native Proton VPN backend and Rust split tunneling service for Omarchy Quattro"
+url="https://github.com/48hoursnonstop/proton-vpn-omarchy-core"
 arch=('x86_64')
 license=('GPL-3.0-or-later')
 provides=('proton-vpn-daemon=0.13.8')
@@ -11,9 +11,7 @@ depends=(
   'networkmanager'
   'networkmanager-vpn-plugin-openvpn'
   'openvpn'
-  'omarchy>=4.0.0'
   'python-proton-vpn-api-core>=5.5.11'
-  'quickshell>=0.3.0'
 )
 makedepends=('rust>=1.75')
 # Rust already performs ThinLTO at the crate graph level. Arch's additional
@@ -21,7 +19,7 @@ makedepends=('rust>=1.75')
 options=('!debug' '!lto')
 install=proton-vpn-omarchy.install
 source=("$pkgname-$pkgver.tar.gz")
-sha256sums=('7fdecd6cff1b8928ce55b1636867f4f62caa5d9f4334c9309fb45bc522094411')
+sha256sums=('SKIP')
 
 build() {
   cd "$pkgname-$pkgver"
@@ -59,17 +57,11 @@ package() {
   install -Dm644 packaging/dbus/me.proton.vpn.split_tunneling.conf \
     "$pkgdir/usr/share/dbus-1/system.d/me.proton.vpn.split_tunneling.conf"
 
-  install -d "$pkgdir/usr/share/proton-vpn-omarchy/plugin"
-  cp -r --no-preserve=ownership plugin/. \
-    "$pkgdir/usr/share/proton-vpn-omarchy/plugin/"
-  find "$pkgdir/usr/share/proton-vpn-omarchy/plugin" -type d -exec chmod 0755 {} +
-  find "$pkgdir/usr/share/proton-vpn-omarchy/plugin" -type f -exec chmod 0644 {} +
-
   install -d "$pkgdir/usr/share/proton-vpn-omarchy/status"
   install -m644 assets/status/*.webp \
     "$pkgdir/usr/share/proton-vpn-omarchy/status/"
 
-  install -Dm644 plugin/README.md \
+  install -Dm644 README.md \
     "$pkgdir/usr/share/doc/$pkgname/README.md"
   install -Dm644 protocol/schema.md \
     "$pkgdir/usr/share/doc/$pkgname/protocol-schema.md"

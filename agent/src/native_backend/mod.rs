@@ -2661,7 +2661,7 @@ impl NativeRuntime {
             "field_count": request.fields.len(),
             "client": support::REPORT_CLIENT,
             "title": support::REPORT_TITLE,
-            "connector_initialized": true,
+            "destination": "proton_ag",
         }))
     }
 
@@ -2680,14 +2680,10 @@ impl NativeRuntime {
             self.api.public_get("/vpn/v2/clientconfig"),
         )
         .await;
-        let (api_reachable, tls_pin_verified, api_error) = match api_probe {
-            Ok(Ok(_)) => (true, true, None),
-            Ok(Err(error)) => (false, false, Some(error.message)),
-            Err(_) => (
-                false,
-                false,
-                Some("The Proton API diagnostics probe timed out".to_owned()),
-            ),
+        let (api_reachable, tls_pin_verified) = match api_probe {
+            Ok(Ok(_)) => (true, true),
+            Ok(Err(_)) => (false, false),
+            Err(_) => (false, false),
         };
         let logs = tokio::task::spawn_blocking(support::collect_log_metadata)
             .await
@@ -2703,6 +2699,24 @@ impl NativeRuntime {
                 })
             })
             .collect::<Vec<_>>();
+        let (os, os_version) = support::os_release();
+        let protocols = available_protocols();
+        let tunnel_state = tunnel_state_name(observation.state);
+        let summary = support::diagnostic_summary(&support::DiagnosticSummary {
+            os: &os,
+            os_version: &os_version,
+            backend_version: NATIVE_VERSION,
+            signed_in,
+            catalog_loaded,
+            client_config_loaded,
+            tunnel_state,
+            protocol: observation.protocol.as_deref(),
+            protocols: &protocols,
+            api_reachable,
+            tls_pin_verified,
+            log_sources_available: sources.len(),
+            log_source_failures: logs.failures.len(),
+        });
         Ok(json!({
             "backend": "proton_rust",
             "backend_version": NATIVE_VERSION,
@@ -2710,18 +2724,16 @@ impl NativeRuntime {
             "catalog_loaded": catalog_loaded,
             "client_config_loaded": client_config_loaded,
             "settings_loaded": true,
-            "connection_observation": tunnel_state_name(observation.state),
-            "connection_id": observation.id,
-            "connection_uuid": observation.uuid,
+            "connection_observation": tunnel_state,
             "protocol": observation.protocol,
-            "protocols": available_protocols(),
+            "protocols": protocols,
             "api_reachable": api_reachable,
             "tls_pin_verified": tls_pin_verified,
-            "api_error": api_error,
             "sources": sources,
             "failure_count": logs.failures.len(),
             "failures": logs.failures,
             "raw_contents_exposed": false,
+            "summary": summary,
         }))
     }
 }
