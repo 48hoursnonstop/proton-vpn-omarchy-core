@@ -45,8 +45,9 @@ jobs:
           GNUPGHOME="$(mktemp -d)"
           trap 'rm -rf -- "$GNUPGHOME"' EXIT
           gpg --batch --quiet --import RELEASE-SIGNING-KEY.asc
-          git verify-tag "$GITHUB_REF_NAME"
-          test "$(git rev-parse "$GITHUB_REF_NAME^{commit}")" = "$GITHUB_SHA"
+          git -c safe.directory="$GITHUB_WORKSPACE" verify-tag "$GITHUB_REF_NAME"
+          test "$(git -c safe.directory="$GITHUB_WORKSPACE" \
+            rev-parse "$GITHUB_REF_NAME^{commit}")" = "$GITHUB_SHA"
 
       - name: Prepare the unprivileged build owner
         shell: bash
