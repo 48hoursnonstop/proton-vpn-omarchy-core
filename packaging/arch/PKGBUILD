@@ -20,9 +20,7 @@ makedepends=('rust>=1.75')
 options=('!debug' '!lto')
 install=proton-vpn-omarchy.install
 source=("$pkgname-$pkgver.tar.gz")
-# Release tags must replace this template value with the deterministic source
-# archive digest. The release workflow rejects SKIP before it builds anything.
-sha256sums=('SKIP')
+sha256sums=('226777dc8d2a9dcc6be1d33bfc92c6801aaa5490e15bc4b2cd98d6a6f8f9c75f')
 
 build() {
   cd "$pkgname-$pkgver"
