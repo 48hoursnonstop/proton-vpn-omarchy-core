@@ -63,6 +63,10 @@ jobs:
           runuser --user builder -- env \
             HOME=/home/builder \
             CARGO_HOME=/home/builder/.cargo \
+            cargo fetch --locked --manifest-path "$GITHUB_WORKSPACE/Cargo.toml"
+          runuser --user builder -- env \
+            HOME=/home/builder \
+            CARGO_HOME=/home/builder/.cargo \
             "$GITHUB_WORKSPACE/packaging/release/build-release" \
             "$version" "$GITHUB_WORKSPACE/dist"
 
