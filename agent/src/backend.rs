@@ -59,10 +59,14 @@ const NATIVE_CAPABILITIES: &[&str] = &[
     "connection.observe",
     "connection.fastest",
     "connection.country",
+    "connection.state",
+    "connection.city",
+    "connection.random_country",
     "connection.server",
     "connection.gateway",
     "connection.gateway_server",
     "connection.secure_core",
+    "connection.secure_core_entry_country",
     "connection.p2p",
     "connection.tor",
     "feature.kill_switch",
@@ -92,6 +96,8 @@ const NATIVE_CAPABILITIES: &[&str] = &[
     "default_connection.canonical",
     "onboarding.preferences",
     "notifications.freedesktop",
+    "network.insecure_wifi",
+    "lifecycle.resume_reconnect",
 ];
 
 impl BackendFlavor {

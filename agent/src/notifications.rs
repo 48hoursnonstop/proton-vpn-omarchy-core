@@ -48,6 +48,7 @@ struct NotificationEmitter {
     last_connection_signature: String,
     last_connection_error_code: String,
     last_forwarded_port: Option<u16>,
+    last_network_generation: u64,
     last_operation_id: String,
     last_attention_stage: String,
 }
@@ -63,6 +64,7 @@ impl NotificationEmitter {
             last_connection_signature: connection_signature(initial),
             last_connection_error_code: initial.connection.error_code.clone().unwrap_or_default(),
             last_forwarded_port: initial.features.port_forwarding.active_port,
+            last_network_generation: initial.network_security.generation,
             last_operation_id: initial
                 .operations
                 .recent
@@ -83,10 +85,57 @@ impl NotificationEmitter {
         self.observe_connection(snapshot, locale, enabled).await;
         self.observe_port_forwarding(snapshot, locale, enabled && port_forwarding_enabled)
             .await;
+        self.observe_network_security(snapshot, locale, enabled)
+            .await;
         self.observe_attention_operation(snapshot, locale, enabled)
             .await;
         self.observe_failed_operation(snapshot, locale, enabled)
             .await;
+    }
+
+    async fn observe_network_security(
+        &mut self,
+        snapshot: &StateSnapshot,
+        locale: &str,
+        enabled: bool,
+    ) {
+        let generation = snapshot.network_security.generation;
+        let changed = generation != self.last_network_generation;
+        if !changed
+            || !enabled
+            || !snapshot.network_security.known
+            || !snapshot.network_security.wifi_connected
+            || !snapshot.network_security.insecure_wifi
+        {
+            if changed
+                && (!snapshot.network_security.wifi_connected
+                    || !snapshot.network_security.insecure_wifi)
+            {
+                self.last_network_generation = generation;
+            }
+            return;
+        }
+        if matches!(
+            snapshot.connection.status,
+            ConnectionStatus::Connecting | ConnectionStatus::Connected
+        ) {
+            // Keep this generation pending so a subsequent unprotected state
+            // can still warn without requiring the Wi-Fi network to change.
+            return;
+        }
+        self.last_network_generation = generation;
+
+        let text = notification_catalog(locale);
+        let message = NotificationMessage {
+            icon: StatusIcon::Information,
+            urgency: "critical",
+            summary: text.insecure_wifi_summary,
+            body: text.insecure_wifi_body.into(),
+        };
+        self.general_id =
+            send_notification(&self.command, &self.icon_dir, self.general_id, message)
+                .await
+                .or(self.general_id);
     }
 
     async fn observe_port_forwarding(
@@ -101,20 +150,14 @@ impl NotificationEmitter {
         let Some(port) = port.filter(|_| changed && enabled) else {
             return;
         };
-        let spanish = is_spanish(locale);
+        let text = notification_catalog(locale);
         let message = NotificationMessage {
             icon: StatusIcon::Information,
             urgency: "normal",
-            summary: if spanish {
-                "Reenvío de puertos activo"
-            } else {
-                "Port forwarding is active"
-            },
-            body: if spanish {
-                format!("Proton VPN asignó el puerto {port}.")
-            } else {
-                format!("Proton VPN assigned port {port}.")
-            },
+            summary: text.port_forwarding_summary,
+            body: text
+                .port_forwarding_body
+                .replace("{port}", &port.to_string()),
         };
         self.general_id =
             send_notification(&self.command, &self.icon_dir, self.general_id, message)
@@ -134,53 +177,29 @@ impl NotificationEmitter {
         self.last_connection_signature = signature;
         self.last_connection_error_code = error_code.to_owned();
 
-        let spanish = is_spanish(locale);
+        let text = notification_catalog(locale);
         let message = if error_code == "p2p_not_allowed" && restriction_changed {
             Some(NotificationMessage {
                 icon: StatusIcon::Information,
                 urgency: "critical",
-                summary: if spanish {
-                    "Tráfico P2P detectado"
-                } else {
-                    "P2P traffic detected"
-                },
-                body: if spanish {
-                    "Este servidor no permite P2P para tu plan. Conéctate a un servidor P2P.".into()
-                } else {
-                    "This server does not allow P2P for your plan. Connect to a P2P server.".into()
-                },
+                summary: text.p2p_detected_summary,
+                body: text.p2p_detected_body.into(),
             })
         } else {
             match status {
                 ConnectionStatus::Connecting if changed => Some(NotificationMessage {
                     icon: StatusIcon::Connecting,
                     urgency: "normal",
-                    summary: if spanish {
-                        "Proton VPN está conectando"
-                    } else {
-                        "Proton VPN is connecting"
-                    },
-                    body: if spanish {
-                        "Preparando una conexión segura…".into()
-                    } else {
-                        "Preparing a secure connection…".into()
-                    },
+                    summary: text.connecting_summary,
+                    body: text.connecting_body.into(),
                 }),
                 ConnectionStatus::Connected if changed || details_changed => {
-                    let destination = connection_destination(snapshot, spanish);
+                    let destination = connection_destination(snapshot, text);
                     Some(NotificationMessage {
                         icon: StatusIcon::Connected,
                         urgency: "normal",
-                        summary: if spanish {
-                            "Proton VPN está conectado"
-                        } else {
-                            "Proton VPN is connected"
-                        },
-                        body: if spanish {
-                            format!("Conectado a {destination}")
-                        } else {
-                            format!("Connected to {destination}")
-                        },
+                        summary: text.connected_summary,
+                        body: text.connected_body.replace("{destination}", &destination),
                     })
                 }
                 ConnectionStatus::Disconnected
@@ -195,31 +214,15 @@ impl NotificationEmitter {
                     Some(NotificationMessage {
                         icon: StatusIcon::Disconnected,
                         urgency: "normal",
-                        summary: if spanish {
-                            "Proton VPN está desconectado"
-                        } else {
-                            "Proton VPN is disconnected"
-                        },
-                        body: if spanish {
-                            "El tráfico ya no usa el túnel VPN.".into()
-                        } else {
-                            "Traffic is no longer using the VPN tunnel.".into()
-                        },
+                        summary: text.disconnected_summary,
+                        body: text.disconnected_body.into(),
                     })
                 }
                 ConnectionStatus::Error if changed => Some(NotificationMessage {
                     icon: StatusIcon::Disconnected,
                     urgency: "critical",
-                    summary: if spanish {
-                        "Error de conexión de Proton VPN"
-                    } else {
-                        "Proton VPN connection error"
-                    },
-                    body: if spanish {
-                        "Abre el panel para ver el error y volver a intentarlo.".into()
-                    } else {
-                        "Open the panel to review the error and try again.".into()
-                    },
+                    summary: text.connection_error_summary,
+                    body: text.connection_error_body.into(),
                 }),
                 _ => None,
             }
@@ -264,56 +267,17 @@ impl NotificationEmitter {
             return;
         }
 
-        let spanish = is_spanish(locale);
+        let text = notification_catalog(locale);
         let (summary, body) = match operation.stage.as_str() {
-            "auth.waiting_for_two_factor" => (
-                if spanish {
-                    "Verificación en dos pasos"
-                } else {
-                    "Two-factor authentication"
-                },
-                if spanish {
-                    "Proton VPN está esperando tu código en el panel."
-                } else {
-                    "Proton VPN is waiting for your code in the panel."
-                },
-            ),
-            "auth.security_key_pin_required" => (
-                if spanish {
-                    "Tu llave necesita un PIN"
-                } else {
-                    "Your security key needs a PIN"
-                },
-                if spanish {
-                    "Vuelve al panel de Proton VPN para ingresarlo."
-                } else {
-                    "Return to the Proton VPN panel to enter it."
-                },
-            ),
+            "auth.waiting_for_two_factor" => (text.two_factor_summary, text.two_factor_body),
+            "auth.security_key_pin_required" => {
+                (text.security_key_pin_summary, text.security_key_pin_body)
+            }
             "auth.touch_security_key" => (
-                if spanish {
-                    "Toca tu llave de seguridad"
-                } else {
-                    "Touch your security key"
-                },
-                if spanish {
-                    "La autenticación continúa en el panel de Proton VPN."
-                } else {
-                    "Authentication is continuing in the Proton VPN panel."
-                },
+                text.touch_security_key_summary,
+                text.touch_security_key_body,
             ),
-            _ => (
-                if spanish {
-                    "Proton VPN necesita tu atención"
-                } else {
-                    "Proton VPN needs your attention"
-                },
-                if spanish {
-                    "Abre el panel para continuar la autenticación."
-                } else {
-                    "Open the panel to continue authentication."
-                },
-            ),
+            _ => (text.attention_summary, text.attention_body),
         };
         self.general_id = send_notification(
             &self.command,
@@ -351,7 +315,7 @@ impl NotificationEmitter {
             return;
         }
 
-        let spanish = is_spanish(locale);
+        let text = notification_catalog(locale);
         self.general_id = send_notification(
             &self.command,
             &self.icon_dir,
@@ -359,16 +323,8 @@ impl NotificationEmitter {
             NotificationMessage {
                 icon: StatusIcon::Information,
                 urgency: "critical",
-                summary: if spanish {
-                    "La operación de Proton VPN falló"
-                } else {
-                    "Proton VPN operation failed"
-                },
-                body: if spanish {
-                    "Abre el panel para revisar el error y volver a intentarlo.".into()
-                } else {
-                    "Open the panel to review the error and try again.".into()
-                },
+                summary: text.operation_failed_summary,
+                body: text.operation_failed_body.into(),
             },
         )
         .await
@@ -390,7 +346,7 @@ fn connection_signature(snapshot: &StateSnapshot) -> String {
     )
 }
 
-fn connection_destination(snapshot: &StateSnapshot, spanish: bool) -> String {
+fn connection_destination(snapshot: &StateSnapshot, text: &NotificationCatalog) -> String {
     snapshot
         .connection
         .country_name
@@ -410,16 +366,110 @@ fn connection_destination(snapshot: &StateSnapshot, spanish: bool) -> String {
                 .as_deref()
                 .filter(|value| !value.is_empty())
         })
-        .unwrap_or(if spanish {
-            "un servidor seguro"
-        } else {
-            "a secure server"
-        })
+        .unwrap_or(text.secure_server)
         .to_owned()
 }
 
-fn is_spanish(locale: &str) -> bool {
-    locale.to_ascii_lowercase().starts_with("es")
+// Each native-notification locale is one complete, compile-time checked
+// catalog. New UI locales safely fall back to English until a catalog is
+// added here; no notification call site needs language-specific branches.
+struct NotificationCatalog {
+    insecure_wifi_summary: &'static str,
+    insecure_wifi_body: &'static str,
+    port_forwarding_summary: &'static str,
+    port_forwarding_body: &'static str,
+    p2p_detected_summary: &'static str,
+    p2p_detected_body: &'static str,
+    connecting_summary: &'static str,
+    connecting_body: &'static str,
+    connected_summary: &'static str,
+    connected_body: &'static str,
+    disconnected_summary: &'static str,
+    disconnected_body: &'static str,
+    connection_error_summary: &'static str,
+    connection_error_body: &'static str,
+    two_factor_summary: &'static str,
+    two_factor_body: &'static str,
+    security_key_pin_summary: &'static str,
+    security_key_pin_body: &'static str,
+    touch_security_key_summary: &'static str,
+    touch_security_key_body: &'static str,
+    attention_summary: &'static str,
+    attention_body: &'static str,
+    operation_failed_summary: &'static str,
+    operation_failed_body: &'static str,
+    secure_server: &'static str,
+}
+
+const ENGLISH_NOTIFICATIONS: NotificationCatalog = NotificationCatalog {
+    insecure_wifi_summary: "The Wi-Fi network is not secure",
+    insecure_wifi_body:
+        "This network does not use WPA encryption. Connect to Proton VPN to protect your traffic.",
+    port_forwarding_summary: "Port forwarding is active",
+    port_forwarding_body: "Proton VPN assigned port {port}.",
+    p2p_detected_summary: "P2P traffic detected",
+    p2p_detected_body: "This server does not allow P2P for your plan. Connect to a P2P server.",
+    connecting_summary: "Proton VPN is connecting",
+    connecting_body: "Preparing a secure connection…",
+    connected_summary: "Proton VPN is connected",
+    connected_body: "Connected to {destination}",
+    disconnected_summary: "Proton VPN is disconnected",
+    disconnected_body: "Traffic is no longer using the VPN tunnel.",
+    connection_error_summary: "Proton VPN connection error",
+    connection_error_body: "Open the panel to review the error and try again.",
+    two_factor_summary: "Two-factor authentication",
+    two_factor_body: "Proton VPN is waiting for your code in the panel.",
+    security_key_pin_summary: "Your security key needs a PIN",
+    security_key_pin_body: "Return to the Proton VPN panel to enter it.",
+    touch_security_key_summary: "Touch your security key",
+    touch_security_key_body: "Authentication is continuing in the Proton VPN panel.",
+    attention_summary: "Proton VPN needs your attention",
+    attention_body: "Open the panel to continue authentication.",
+    operation_failed_summary: "Proton VPN operation failed",
+    operation_failed_body: "Open the panel to review the error and try again.",
+    secure_server: "a secure server",
+};
+
+const SPANISH_NOTIFICATIONS: NotificationCatalog = NotificationCatalog {
+    insecure_wifi_summary: "La red Wi-Fi no es segura",
+    insecure_wifi_body:
+        "Esta red no usa cifrado WPA. Conéctate a Proton VPN para proteger tu tráfico.",
+    port_forwarding_summary: "Reenvío de puertos activo",
+    port_forwarding_body: "Proton VPN asignó el puerto {port}.",
+    p2p_detected_summary: "Tráfico P2P detectado",
+    p2p_detected_body: "Este servidor no permite P2P para tu plan. Conéctate a un servidor P2P.",
+    connecting_summary: "Proton VPN está conectando",
+    connecting_body: "Preparando una conexión segura…",
+    connected_summary: "Proton VPN está conectado",
+    connected_body: "Conectado a {destination}",
+    disconnected_summary: "Proton VPN está desconectado",
+    disconnected_body: "El tráfico ya no usa el túnel VPN.",
+    connection_error_summary: "Error de conexión de Proton VPN",
+    connection_error_body: "Abre el panel para ver el error y volver a intentarlo.",
+    two_factor_summary: "Verificación en dos pasos",
+    two_factor_body: "Proton VPN está esperando tu código en el panel.",
+    security_key_pin_summary: "Tu llave necesita un PIN",
+    security_key_pin_body: "Vuelve al panel de Proton VPN para ingresarlo.",
+    touch_security_key_summary: "Toca tu llave de seguridad",
+    touch_security_key_body: "La autenticación continúa en el panel de Proton VPN.",
+    attention_summary: "Proton VPN necesita tu atención",
+    attention_body: "Abre el panel para continuar la autenticación.",
+    operation_failed_summary: "La operación de Proton VPN falló",
+    operation_failed_body: "Abre el panel para revisar el error y volver a intentarlo.",
+    secure_server: "un servidor seguro",
+};
+
+fn notification_catalog(locale: &str) -> &'static NotificationCatalog {
+    match locale
+        .split(['-', '_'])
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "es" => &SPANISH_NOTIFICATIONS,
+        _ => &ENGLISH_NOTIFICATIONS,
+    }
 }
 
 #[derive(Clone, Copy)]

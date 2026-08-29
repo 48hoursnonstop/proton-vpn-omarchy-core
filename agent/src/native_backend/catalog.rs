@@ -133,6 +133,9 @@ impl ServerCatalog {
         let mut gateways: BTreeMap<String, Value> = BTreeMap::new();
         let mut subdivisions: BTreeMap<String, BTreeMap<String, BTreeSet<String>>> =
             BTreeMap::new();
+        let mut p2p_subdivisions: BTreeMap<String, BTreeMap<String, BTreeSet<String>>> =
+            BTreeMap::new();
+        let mut secure_core_entries: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
 
         for server in self
             .logical_servers
@@ -162,10 +165,17 @@ impl ServerCatalog {
             }
 
             let code = server.exit_country.to_ascii_uppercase();
-            let by_state = subdivisions.entry(code.clone()).or_default();
-            let cities = by_state.entry(server.state.clone()).or_default();
-            if !server.city.is_empty() {
-                cities.insert(server.city.clone());
+            if server.features & FEATURE_SECURE_CORE != 0 && !server.entry_country.is_empty() {
+                secure_core_entries
+                    .entry(code.clone())
+                    .or_default()
+                    .insert(server.entry_country.to_ascii_uppercase());
+            }
+            if server.standard() {
+                insert_subdivision(&mut subdivisions, &code, server);
+            }
+            if server.features & FEATURE_P2P != 0 {
+                insert_subdivision(&mut p2p_subdivisions, &code, server);
             }
             let entry = countries.entry(code.clone()).or_insert_with(|| {
                 json!({
@@ -197,22 +207,30 @@ impl ServerCatalog {
             );
         }
 
-        for (code, by_state) in subdivisions {
-            let Some(country) = countries.get_mut(&code).and_then(Value::as_object_mut) else {
+        for (code, country_value) in &mut countries {
+            let Some(country) = country_value.as_object_mut() else {
                 continue;
             };
-            let mut country_cities = Vec::new();
-            let mut states = Vec::new();
-            for (state, cities) in by_state {
-                let cities = cities.into_iter().collect::<Vec<_>>();
-                if state.is_empty() {
-                    country_cities.extend(cities);
-                } else {
-                    states.push(json!({ "name": state, "cities": cities }));
-                }
-            }
+            let (states, country_cities) =
+                serialized_subdivisions(subdivisions.remove(code).unwrap_or_default());
             country.insert("cities".into(), json!(country_cities));
             country.insert("states".into(), json!(states));
+            let (p2p_states, p2p_cities) =
+                serialized_subdivisions(p2p_subdivisions.remove(code).unwrap_or_default());
+            country.insert("p2p_cities".into(), json!(p2p_cities));
+            country.insert("p2p_states".into(), json!(p2p_states));
+            let entries = secure_core_entries
+                .remove(code)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|entry_code| {
+                    json!({
+                        "code": entry_code,
+                        "name": country_name(&entry_code),
+                    })
+                })
+                .collect::<Vec<_>>();
+            country.insert("secure_core_entries".into(), json!(entries));
         }
 
         let mut countries = countries.into_values().collect::<Vec<_>>();
@@ -237,6 +255,7 @@ impl ServerCatalog {
             .ok_or_else(|| NativeError::new("invalid_params", "target must be a JSON object"))?;
         let server_name = object_string(target, "server_name");
         let country_code = object_string(target, "country_code").to_ascii_uppercase();
+        let entry_country_code = object_string(target, "entry_country_code").to_ascii_uppercase();
         let state_name = object_string(target, "state");
         let city_name = object_string(target, "city");
         let gateway_name = object_string(target, "gateway_name");
@@ -260,6 +279,12 @@ impl ServerCatalog {
                 "State/city connection targets require country_code",
             ));
         }
+        if !entry_country_code.is_empty() && !secure_core {
+            return Err(NativeError::new(
+                "invalid_params",
+                "Secure Core entry-country targets require secure_core",
+            ));
+        }
 
         let available = self
             .logical_servers
@@ -278,6 +303,12 @@ impl ServerCatalog {
                 .copied()
                 .filter(|server| gateway_name.is_empty() || server.gateway_name() == gateway_name)
                 .filter(|server| country_code.is_empty() || server.exit_country == country_code)
+                .filter(|server| {
+                    entry_country_code.is_empty()
+                        || server
+                            .entry_country
+                            .eq_ignore_ascii_case(&entry_country_code)
+                })
                 .filter(|server| {
                     state_name.is_empty() || server.state.eq_ignore_ascii_case(&state_name)
                 })
@@ -299,6 +330,7 @@ impl ServerCatalog {
 
             let explicit_location = !server_name.is_empty()
                 || !country_code.is_empty()
+                || !entry_country_code.is_empty()
                 || !state_name.is_empty()
                 || !city_name.is_empty()
                 || !gateway_name.is_empty();
@@ -318,15 +350,24 @@ impl ServerCatalog {
             }
 
             if random_target || free_random {
-                candidates.choose(&mut rand::rng()).copied()
-            } else {
-                candidates.sort_by(|left, right| {
-                    left.score
-                        .partial_cmp(&right.score)
-                        .unwrap_or(Ordering::Equal)
-                });
-                candidates.first().copied()
+                // Windows' "Random country" is uniform over eligible countries,
+                // then selects that country's best server. Choosing a logical
+                // server directly would bias countries with larger fleets.
+                let countries = candidates
+                    .iter()
+                    .map(|server| server.exit_country.as_str())
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .collect::<Vec<_>>();
+                let selected_country = countries.choose(&mut rand::rng()).copied();
+                candidates.retain(|server| selected_country == Some(server.exit_country.as_str()));
             }
+            candidates.sort_by(|left, right| {
+                left.score
+                    .partial_cmp(&right.score)
+                    .unwrap_or(Ordering::Equal)
+            });
+            candidates.first().copied()
         }
         .ok_or_else(|| {
             NativeError::new(
@@ -447,6 +488,37 @@ fn set_feature(value: &mut Value, key: &str, enabled: bool) {
     }
 }
 
+fn insert_subdivision(
+    subdivisions: &mut BTreeMap<String, BTreeMap<String, BTreeSet<String>>>,
+    country_code: &str,
+    server: &LogicalServer,
+) {
+    let cities = subdivisions
+        .entry(country_code.to_owned())
+        .or_default()
+        .entry(server.state.clone())
+        .or_default();
+    if !server.city.is_empty() {
+        cities.insert(server.city.clone());
+    }
+}
+
+fn serialized_subdivisions(
+    subdivisions: BTreeMap<String, BTreeSet<String>>,
+) -> (Vec<Value>, Vec<String>) {
+    let mut country_cities = Vec::new();
+    let mut states = Vec::new();
+    for (state, cities) in subdivisions {
+        let cities = cities.into_iter().collect::<Vec<_>>();
+        if state.is_empty() {
+            country_cities.extend(cities);
+        } else {
+            states.push(json!({ "name": state, "cities": cities }));
+        }
+    }
+    (states, country_cities)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -529,5 +601,91 @@ mod tests {
             .select(&json!({"target": {"country_code": "US"}}), 1, &excluded)
             .unwrap();
         assert_eq!(explicit.logical.name, "US");
+    }
+
+    #[test]
+    fn random_country_always_uses_the_best_server_in_the_chosen_country() {
+        let mut us_best = logical("US-best", "US", 0, 0.1);
+        us_best.tier = 1;
+        let mut us_worse = logical("US-worse", "US", 0, 99.0);
+        us_worse.tier = 1;
+        let mut ch_best = logical("CH-best", "CH", 0, 0.2);
+        ch_best.tier = 1;
+        let catalog = ServerCatalog {
+            expiration_time: 0.0,
+            loads_expiration_time: 0.0,
+            max_tier: 1,
+            logical_servers: vec![us_worse, ch_best, us_best],
+            extra: Default::default(),
+        };
+
+        for _ in 0..64 {
+            let selected = catalog
+                .select(&json!({"target": {"random": true}}), 1, &[])
+                .unwrap();
+            assert!(matches!(
+                selected.logical.name.as_str(),
+                "US-best" | "CH-best"
+            ));
+        }
+    }
+
+    #[test]
+    fn secure_core_can_target_an_entry_country_without_pinning_a_server() {
+        let mut via_ch = logical("SC-via-CH", "US", FEATURE_SECURE_CORE, 0.5);
+        via_ch.entry_country = "CH".into();
+        via_ch.tier = 1;
+        let mut via_se = logical("SC-via-SE", "US", FEATURE_SECURE_CORE, 0.1);
+        via_se.entry_country = "SE".into();
+        via_se.tier = 1;
+        let catalog = ServerCatalog {
+            expiration_time: 0.0,
+            loads_expiration_time: 0.0,
+            max_tier: 1,
+            logical_servers: vec![via_se, via_ch],
+            extra: Default::default(),
+        };
+
+        let selected = catalog
+            .select(
+                &json!({"target": {
+                    "country_code": "US",
+                    "entry_country_code": "CH",
+                    "secure_core": true
+                }}),
+                1,
+                &[],
+            )
+            .unwrap();
+        assert_eq!(selected.logical.name, "SC-via-CH");
+
+        let error = catalog
+            .select(&json!({"target": {"entry_country_code": "CH"}}), 1, &[])
+            .unwrap_err();
+        assert_eq!(error.code, "invalid_params");
+    }
+
+    #[test]
+    fn locations_keep_standard_and_p2p_subdivisions_separate() {
+        let mut standard = logical("Standard", "US", 0, 0.2);
+        standard.state = "California".into();
+        standard.city = "Los Angeles".into();
+        let mut p2p = logical("P2P", "US", FEATURE_P2P, 0.1);
+        p2p.state = "New York".into();
+        p2p.city = "New York".into();
+        let catalog = ServerCatalog {
+            expiration_time: 0.0,
+            loads_expiration_time: 0.0,
+            max_tier: 0,
+            logical_servers: vec![standard, p2p],
+            extra: Default::default(),
+        };
+
+        let locations = catalog.locations(0);
+        let country = &locations["countries"][0];
+        assert_eq!(country["states"][0]["name"], "California");
+        assert_eq!(country["states"][0]["cities"][0], "Los Angeles");
+        assert_eq!(country["p2p_states"][0]["name"], "New York");
+        assert_eq!(country["p2p_states"][0]["cities"][0], "New York");
     }
 }

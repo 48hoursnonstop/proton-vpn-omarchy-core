@@ -1,6 +1,6 @@
 {
-  "checkpoint": "0.8.0-plugin-first-release",
-  "audited_at": "2026-08-26",
+  "checkpoint": "0.8.9-windows-parity-follow-up",
+  "audited_at": "2026-08-28",
   "decision": "COMPLETE_TO_DECLARED_PRODUCT_SCOPE",
   "backend": {
     "only": "native_rust_v2",
@@ -21,6 +21,8 @@
     "connection_statistics_feedback": "IMPLEMENTED",
     "p2p_traffic_detection_notice": "IMPLEMENTED",
     "countries_cities_servers_search": "IMPLEMENTED",
+    "state_city_and_secure_core_entry_hierarchy": "IMPLEMENTED",
+    "random_country_uniform_selection": "IMPLEMENTED",
     "secure_core_p2p_tor_gateways": "IMPLEMENTED",
     "profiles_crud_icons_colors_and_connect_and_go": "IMPLEMENTED",
     "profiles_explicit_duplicate_action": "IMPLEMENTED",
@@ -33,6 +35,8 @@
     "kill_switch_standard_advanced_and_network_blocked_observation": "IMPLEMENTED",
     "kill_switch_and_split_tunneling_simultaneously_uid_scoped_fail_closed": "IMPLEMENTED",
     "automatic_conflicting_vpn_and_tunnel_detection": "IMPLEMENTED",
+    "insecure_wifi_observation_and_warning": "IMPLEMENTED",
+    "suspend_resume_reconnection": "IMPLEMENTED",
     "netshield_dns_vpn_accelerator": "IMPLEMENTED",
     "moderate_nat_and_port_forwarding": "IMPLEMENTED",
     "ipv6_and_ipv6_leak_protection": "IMPLEMENTED",

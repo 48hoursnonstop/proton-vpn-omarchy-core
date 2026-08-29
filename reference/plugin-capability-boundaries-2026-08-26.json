@@ -1,6 +1,6 @@
 {
-  "checkpoint": "0.8.0-plugin-first-release",
-  "audited_at": "2026-08-26",
+  "checkpoint": "0.8.9-windows-parity-follow-up",
+  "audited_at": "2026-08-28",
   "target": {
     "omarchy": "4.x",
     "python-proton-vpn-api-core": "5.5.11-1",
@@ -11,7 +11,7 @@
     "local_agent_reference_commit": "74ec6f4f093805d766f11f9ef522bf1120591058"
   },
   "native_backend": {
-    "version": "0.8.0/rust-v2",
+    "version": "0.8.9/rust-v2",
     "only_runtime_backend": true,
     "legacy_python_bridge": "removed from runtime and package",
     "tunnel_engines": {
@@ -38,7 +38,8 @@
   "project_extensions": {
     "split_tunneling_ip_ranges": "IPv4/IPv6 hosts and CIDRs are canonicalized, persisted and enforced with UID-scoped LPM maps at connect/sendmsg hooks.",
     "local_area_network_access_policy": "Private, unique-local and link-local destinations use the same Proton bypass mark through a separate authenticated policy map.",
-    "local_dns_access_policy": "Only exact private/link-local physical resolvers plus mDNS/LLMNR multicast destinations bypass; public resolvers are never imported from the physical link."
+    "local_dns_access_policy": "Only exact private/link-local physical resolvers plus mDNS/LLMNR multicast destinations bypass; public resolvers are never imported from the physical link.",
+    "split_tunneling_route_ownership": "Kill Switch coexistence routes are UID-scoped, tagged, durably tracked and removed by exact route/rule identity; foreign tables or priorities cause a fail-closed collision error and are never flushed."
   },
   "blocked_upstream": {},
   "platform_policy": {

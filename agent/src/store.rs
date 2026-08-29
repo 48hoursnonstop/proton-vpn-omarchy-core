@@ -808,10 +808,18 @@ fn resolved_recent(account: &AccountStore, recent: &Value, selection_type: &str)
 
     let mut target = Map::new();
     copy_nonempty_string(object, &mut target, "countryCode", "country_code");
+    copy_nonempty_string(
+        object,
+        &mut target,
+        "entryCountryCode",
+        "entry_country_code",
+    );
+    copy_nonempty_string(object, &mut target, "state", "state");
+    copy_nonempty_string(object, &mut target, "city", "city");
     copy_nonempty_string(object, &mut target, "serverName", "server_name");
     copy_nonempty_string(object, &mut target, "gatewayName", "gateway_name");
     match kind.as_str() {
-        "country" => match object
+        "country" | "state" | "city" => match object
             .get("feature")
             .and_then(Value::as_str)
             .unwrap_or("all")
@@ -821,6 +829,9 @@ fn resolved_recent(account: &AccountStore, recent: &Value, selection_type: &str)
             }
             "tor" => {
                 target.insert("tor".into(), Value::Bool(true));
+            }
+            "secure_core" => {
+                target.insert("secure_core".into(), Value::Bool(true));
             }
             _ => {}
         },
@@ -856,10 +867,18 @@ fn resolved_profile(profile: &Value, selection_type: &str) -> BackendResult {
     let kind = required_string(object, "targetKind", 32)?;
     let mut target = Map::new();
     copy_nonempty_string(object, &mut target, "countryCode", "country_code");
+    copy_nonempty_string(
+        object,
+        &mut target,
+        "entryCountryCode",
+        "entry_country_code",
+    );
+    copy_nonempty_string(object, &mut target, "state", "state");
+    copy_nonempty_string(object, &mut target, "city", "city");
     copy_nonempty_string(object, &mut target, "serverName", "server_name");
     copy_nonempty_string(object, &mut target, "gatewayName", "gateway_name");
     match kind.as_str() {
-        "fastest" | "country" | "server" | "gateway" | "gatewayServer" => {}
+        "fastest" | "country" | "state" | "city" | "server" | "gateway" | "gatewayServer" => {}
         "p2p" => {
             target.insert("p2p".into(), Value::Bool(true));
         }
@@ -949,6 +968,8 @@ fn normalize_profile(
     insert_profile_string(raw, &mut profile, "countryName", 128, false)?;
     insert_profile_string(raw, &mut profile, "entryCountryCode", 2, true)?;
     insert_profile_string(raw, &mut profile, "entryCountryName", 128, false)?;
+    insert_profile_string(raw, &mut profile, "state", 128, false)?;
+    insert_profile_string(raw, &mut profile, "city", 128, false)?;
     insert_profile_string(raw, &mut profile, "serverName", 128, false)?;
     insert_profile_string(raw, &mut profile, "gatewayName", 128, false)?;
     if !profile_target_valid(&target_kind, &profile) {
@@ -1102,8 +1123,11 @@ fn insert_profile_string(
 
 fn profile_target_valid(kind: &str, value: &Map<String, Value>) -> bool {
     match kind {
-        "fastest" | "p2p" | "secureCore" | "tor" => true,
+        "fastest" | "p2p" | "tor" => true,
+        "secureCore" => !nonempty(value, "entryCountryCode") || nonempty(value, "countryCode"),
         "country" => nonempty(value, "countryCode"),
+        "state" => nonempty(value, "countryCode") && nonempty(value, "state"),
+        "city" => nonempty(value, "countryCode") && nonempty(value, "city"),
         "server" => nonempty(value, "countryCode") && nonempty(value, "serverName"),
         "gateway" => nonempty(value, "gatewayName"),
         "gatewayServer" => nonempty(value, "gatewayName") && nonempty(value, "serverName"),
@@ -1116,8 +1140,14 @@ fn recent_target_valid(kind: &str, value: &Map<String, Value>) -> bool {
         "profile" => nonempty(value, "profileId"),
         "gateway" => nonempty(value, "gatewayName"),
         "gatewayServer" => nonempty(value, "gatewayName") && nonempty(value, "serverName"),
-        "secureCore" | "server" | "tor" => nonempty(value, "serverName"),
+        "secureCore" => {
+            nonempty(value, "serverName")
+                || nonempty(value, "countryCode") && nonempty(value, "entryCountryCode")
+        }
+        "server" | "tor" => nonempty(value, "serverName"),
         "country" => nonempty(value, "countryCode"),
+        "state" => nonempty(value, "countryCode") && nonempty(value, "state"),
+        "city" => nonempty(value, "countryCode") && nonempty(value, "city"),
         _ => false,
     }
 }
@@ -1135,15 +1165,16 @@ fn normalize_recent(raw: &Map<String, Value>) -> Result<Map<String, Value>, Back
     insert_recent_string(raw, &mut recent, "countryName", 128, false)?;
     insert_recent_string(raw, &mut recent, "entryCountryCode", 2, true)?;
     insert_recent_string(raw, &mut recent, "entryCountryName", 128, false)?;
+    insert_recent_string(raw, &mut recent, "state", 128, false)?;
     insert_recent_string(raw, &mut recent, "city", 128, false)?;
     insert_recent_string(raw, &mut recent, "serverName", 128, false)?;
 
-    if kind == "country" {
+    if matches!(kind.as_str(), "country" | "state" | "city") {
         let feature = string_or(raw, "feature", "standard", 32)?.to_ascii_lowercase();
         if !["standard", "all", "secure_core", "p2p", "tor"].contains(&feature.as_str()) {
             return Err(BackendError::new(
                 "invalid_recent_target",
-                "Recent country feature is unsupported",
+                "Recent location feature is unsupported",
             ));
         }
         recent.insert("feature".into(), Value::String(feature));
@@ -1202,7 +1233,7 @@ fn recent_key(value: &Map<String, Value>) -> String {
             )
         }
         kind => format!(
-            "{}:{}:{}:{}:{}",
+            "{}:{}:{}:{}:{}:{}:{}",
             kind,
             value
                 .get("feature")
@@ -1210,6 +1241,8 @@ fn recent_key(value: &Map<String, Value>) -> String {
                 .unwrap_or("all"),
             field("entryCountryCode"),
             field("countryCode"),
+            field("state"),
+            field("city"),
             field("serverName")
         ),
     }
@@ -1639,14 +1672,47 @@ fn optional_bool(
 }
 
 fn locale_value(value: Option<&Value>) -> Result<String, BackendError> {
-    match value.and_then(Value::as_str) {
-        Some("es-MX") => Ok("es-MX".into()),
-        Some("en") => Ok("en".into()),
-        _ => Err(BackendError::new(
+    let raw = value
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .replace('_', "-");
+    let parts = raw.split('-').collect::<Vec<_>>();
+    let valid = !raw.is_empty()
+        && raw.len() <= 35
+        && (2..=8).contains(&parts[0].len())
+        && parts[0].bytes().all(|byte| byte.is_ascii_alphabetic())
+        && parts.iter().skip(1).all(|part| {
+            !part.is_empty()
+                && part.len() <= 8
+                && part.bytes().all(|byte| byte.is_ascii_alphanumeric())
+        });
+    if !valid {
+        return Err(BackendError::new(
             "invalid_locale",
-            "locale must be es-MX or en",
-        )),
+            "locale must be a valid bounded BCP 47 language tag",
+        ));
     }
+
+    let canonical = parts
+        .iter()
+        .enumerate()
+        .map(|(index, part)| {
+            if index == 0 {
+                part.to_ascii_lowercase()
+            } else if part.len() == 2 && part.bytes().all(|byte| byte.is_ascii_alphabetic()) {
+                part.to_ascii_uppercase()
+            } else if part.len() == 4 && part.bytes().all(|byte| byte.is_ascii_alphabetic()) {
+                let mut value = part.to_ascii_lowercase();
+                value[0..1].make_ascii_uppercase();
+                value
+            } else {
+                part.to_ascii_lowercase()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("-");
+    Ok(canonical)
 }
 
 fn bounded_usize(
@@ -1881,5 +1947,118 @@ mod tests {
             Some(&json!("Streaming copy 2"))
         );
         assert_eq!(account_ref(&data).profiles.len(), 3);
+    }
+
+    #[test]
+    fn hierarchical_profiles_preserve_and_resolve_location_constraints() {
+        let city = normalize_profile(
+            json!({
+                "name": "Seattle",
+                "targetKind": "city",
+                "countryCode": "us",
+                "state": "Washington",
+                "city": "Seattle"
+            })
+            .as_object()
+            .unwrap(),
+            None,
+            "profile-city",
+        )
+        .expect("normalize city profile");
+        let resolved =
+            resolved_profile(&Value::Object(city), "profile").expect("resolve city profile");
+        assert_eq!(resolved["connect_params"]["target"]["country_code"], "US");
+        assert_eq!(resolved["connect_params"]["target"]["state"], "Washington");
+        assert_eq!(resolved["connect_params"]["target"]["city"], "Seattle");
+
+        let p2p_city = normalize_profile(
+            json!({
+                "name": "P2P Seattle",
+                "targetKind": "p2p",
+                "countryCode": "us",
+                "state": "Washington",
+                "city": "Seattle"
+            })
+            .as_object()
+            .unwrap(),
+            None,
+            "profile-p2p-city",
+        )
+        .expect("normalize P2P city profile");
+        let resolved = resolved_profile(&Value::Object(p2p_city), "profile")
+            .expect("resolve P2P city profile");
+        assert_eq!(resolved["connect_params"]["target"]["city"], "Seattle");
+        assert_eq!(resolved["connect_params"]["target"]["p2p"], true);
+
+        let secure_core = normalize_profile(
+            json!({
+                "name": "US via Switzerland",
+                "targetKind": "secureCore",
+                "countryCode": "us",
+                "entryCountryCode": "ch"
+            })
+            .as_object()
+            .unwrap(),
+            None,
+            "profile-secure-core",
+        )
+        .expect("normalize Secure Core profile");
+        let resolved = resolved_profile(&Value::Object(secure_core), "profile")
+            .expect("resolve Secure Core profile");
+        assert_eq!(
+            resolved["connect_params"]["target"]["entry_country_code"],
+            "CH"
+        );
+        assert_eq!(resolved["connect_params"]["target"]["secure_core"], true);
+    }
+
+    #[test]
+    fn hierarchical_recents_keep_state_and_city_in_their_identity() {
+        let washington = normalize_recent(
+            json!({
+                "kind": "city",
+                "header": "Seattle",
+                "countryCode": "US",
+                "state": "Washington",
+                "city": "Seattle",
+                "feature": "p2p"
+            })
+            .as_object()
+            .unwrap(),
+        )
+        .expect("normalize Washington city");
+        let resolved = resolved_recent(
+            &AccountStore::default(),
+            &Value::Object(washington.clone()),
+            "last",
+        )
+        .expect("resolve P2P city");
+        assert_eq!(resolved["connect_params"]["target"]["p2p"], true);
+        let kansas = normalize_recent(
+            json!({
+                "kind": "city",
+                "header": "Seattle",
+                "countryCode": "US",
+                "state": "Kansas",
+                "city": "Seattle"
+            })
+            .as_object()
+            .unwrap(),
+        )
+        .expect("normalize Kansas city");
+        assert_ne!(recent_key(&washington), recent_key(&kansas));
+    }
+
+    #[test]
+    fn locale_storage_accepts_bounded_bcp47_tags_and_canonicalizes_them() {
+        assert_eq!(locale_value(Some(&json!("es_mx"))).unwrap(), "es-MX");
+        assert_eq!(
+            locale_value(Some(&json!("zh-hant-tw"))).unwrap(),
+            "zh-Hant-TW"
+        );
+        assert_eq!(locale_value(Some(&json!("pt-BR"))).unwrap(), "pt-BR");
+        assert!(locale_value(Some(&json!("../locale"))).is_err());
+        assert!(locale_value(Some(&json!("x"))).is_err());
+        assert!(locale_value(Some(&json!("en-123456789"))).is_err());
     }
 }

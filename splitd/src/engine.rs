@@ -56,10 +56,18 @@ impl Engine {
     }
 
     fn with_store(store: StateStore, routing_enabled: bool) -> io::Result<Self> {
-        let loaded = store.load()?;
+        let mut loaded = store.load()?;
         if routing_enabled {
-            for uid in loaded.configs.keys().copied() {
-                routing::disable(uid)?;
+            for (uid, routes) in &loaded.kill_switch_bypass {
+                routing::disable(*uid, routes)?;
+            }
+            if !loaded.kill_switch_bypass.is_empty() {
+                loaded.kill_switch_bypass.clear();
+                store.save(
+                    &loaded.configs,
+                    &loaded.destination_policies,
+                    &loaded.kill_switch_bypass,
+                )?;
             }
         }
         let mut initial = Inner {
@@ -155,18 +163,23 @@ impl Engine {
                 ));
             }
             let bypass = if routing_enabled && !config.has_rules() {
-                let bypass = inner.kill_switch_bypass.remove(&uid);
-                if bypass.is_some() {
-                    routing::disable(uid)?;
+                let bypass = inner.kill_switch_bypass.get(&uid).cloned();
+                if let Some(routes) = &bypass {
+                    routing::disable(uid, routes)?;
+                    inner.kill_switch_bypass.remove(&uid);
                 }
                 bypass
             } else {
                 None
             };
             let previous = inner.configs.insert(uid, config);
-            if let Err(error) = reconcile(&mut inner)
-                .and_then(|()| store.save(&inner.configs, &inner.destination_policies))
-            {
+            if let Err(error) = reconcile(&mut inner).and_then(|()| {
+                store.save(
+                    &inner.configs,
+                    &inner.destination_policies,
+                    &inner.kill_switch_bypass,
+                )
+            }) {
                 match previous {
                     Some(config) => {
                         inner.configs.insert(uid, config);
@@ -195,17 +208,29 @@ impl Engine {
         let routing_enabled = self.routing_enabled;
         tokio::task::spawn_blocking(move || {
             let mut inner = lock_inner(&inner)?;
-            if routing_enabled && inner.kill_switch_bypass.contains_key(&uid) {
-                routing::disable(uid)?;
-                inner.kill_switch_bypass.remove(&uid);
+            let bypass = inner.kill_switch_bypass.get(&uid).cloned();
+            if routing_enabled {
+                if let Some(routes) = &bypass {
+                    routing::disable(uid, routes)?;
+                    inner.kill_switch_bypass.remove(&uid);
+                }
             }
             let previous = inner.configs.remove(&uid);
-            if let Err(error) = reconcile(&mut inner)
-                .and_then(|()| store.save(&inner.configs, &inner.destination_policies))
-            {
+            if let Err(error) = reconcile(&mut inner).and_then(|()| {
+                store.save(
+                    &inner.configs,
+                    &inner.destination_policies,
+                    &inner.kill_switch_bypass,
+                )
+            }) {
                 if let Some(config) = previous {
                     inner.configs.insert(uid, config);
                     let _ = reconcile(&mut inner);
+                }
+                if let Some(routes) = bypass {
+                    if let Ok(installed) = routing::enable(uid, &routes) {
+                        inner.kill_switch_bypass.insert(uid, installed);
+                    }
                 }
                 return Err(error);
             }
@@ -228,6 +253,7 @@ impl Engine {
         routes: Vec<PhysicalRoute>,
     ) -> io::Result<()> {
         let inner = Arc::clone(&self.inner);
+        let store = self.store.clone();
         let routing_enabled = self.routing_enabled;
         tokio::task::spawn_blocking(move || {
             let mut inner = lock_inner(&inner)?;
@@ -247,13 +273,50 @@ impl Engine {
                 if inner.kill_switch_bypass.get(&uid) == Some(&routes) {
                     return Ok(());
                 }
-                let installed = routing::enable(uid, &routes)?;
+                let previous = inner.kill_switch_bypass.get(&uid).cloned();
+                if let Some(previous_routes) = &previous {
+                    routing::disable(uid, previous_routes)?;
+                    inner.kill_switch_bypass.remove(&uid);
+                }
+                let installed = match routing::enable(uid, &routes) {
+                    Ok(installed) => installed,
+                    Err(error) => {
+                        if let Some(previous_routes) = previous {
+                            if let Ok(restored) = routing::enable(uid, &previous_routes) {
+                                inner.kill_switch_bypass.insert(uid, restored);
+                            }
+                        }
+                        return Err(error);
+                    }
+                };
                 inner.kill_switch_bypass.insert(uid, installed);
-            } else if inner.kill_switch_bypass.remove(&uid).is_some() {
-                routing::disable(uid)?;
-            } else {
-                // Also remove stale state left by an unclean service exit.
-                routing::disable(uid)?;
+                if let Err(error) = store.save(
+                    &inner.configs,
+                    &inner.destination_policies,
+                    &inner.kill_switch_bypass,
+                ) {
+                    let installed = inner.kill_switch_bypass.remove(&uid).unwrap_or_default();
+                    let _ = routing::disable(uid, &installed);
+                    if let Some(previous_routes) = previous {
+                        if let Ok(restored) = routing::enable(uid, &previous_routes) {
+                            inner.kill_switch_bypass.insert(uid, restored);
+                        }
+                    }
+                    return Err(error);
+                }
+            } else if let Some(installed) = inner.kill_switch_bypass.get(&uid).cloned() {
+                routing::disable(uid, &installed)?;
+                inner.kill_switch_bypass.remove(&uid);
+                if let Err(error) = store.save(
+                    &inner.configs,
+                    &inner.destination_policies,
+                    &inner.kill_switch_bypass,
+                ) {
+                    if let Ok(restored) = routing::enable(uid, &installed) {
+                        inner.kill_switch_bypass.insert(uid, restored);
+                    }
+                    return Err(error);
+                }
             }
             Ok(())
         })
@@ -280,9 +343,13 @@ impl Engine {
             } else {
                 inner.destination_policies.insert(uid, ranges)
             };
-            if let Err(error) = reconcile(&mut inner)
-                .and_then(|()| store.save(&inner.configs, &inner.destination_policies))
-            {
+            if let Err(error) = reconcile(&mut inner).and_then(|()| {
+                store.save(
+                    &inner.configs,
+                    &inner.destination_policies,
+                    &inner.kill_switch_bypass,
+                )
+            }) {
                 match previous {
                     Some(ranges) => {
                         inner.destination_policies.insert(uid, ranges);
@@ -338,8 +405,8 @@ impl Drop for Engine {
         self.reconcile_task.abort();
         if self.routing_enabled {
             if let Ok(inner) = self.inner.lock() {
-                for uid in inner.kill_switch_bypass.keys().copied() {
-                    let _ = routing::disable(uid);
+                for (uid, routes) in &inner.kill_switch_bypass {
+                    let _ = routing::disable(*uid, routes);
                 }
             }
         }

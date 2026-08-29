@@ -6,6 +6,7 @@ use super::{
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use ed25519_dalek::SigningKey;
 use nmdbus::{
+    accesspoint::AccessPoint,
     connection_active::ConnectionActive,
     dbus::{
         self,
@@ -13,6 +14,7 @@ use nmdbus::{
         blocking::Connection,
     },
     device::Device,
+    device_wireless::DeviceWireless,
     ip4config::IP4Config,
     ip6config::IP6Config,
     settings::Settings,
@@ -80,6 +82,13 @@ pub struct TunnelObservation {
     pub protocol: Option<String>,
     pub endpoint: Option<String>,
     pub owned: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct WifiSecurityObservation {
+    /// Stable only for the lifetime of the active association. Never leaves the agent.
+    pub identity: Vec<u8>,
+    pub secure: bool,
 }
 
 #[derive(Clone)]
@@ -527,6 +536,45 @@ impl OpenVpnProfile {
 pub struct NetworkManagerBackend;
 
 impl NetworkManagerBackend {
+    pub(super) fn wifi_security(&self) -> NativeResult<Option<WifiSecurityObservation>> {
+        let connection = system_bus()?;
+        let root = connection.with_proxy(NM_BUS, NM_PATH, Duration::from_secs(5));
+        let mut observations = Vec::new();
+        for device_path in NetworkManager::devices(&root)
+            .map_err(|error| nm_error("list NetworkManager devices", error))?
+        {
+            let device = connection.with_proxy(NM_BUS, device_path, Duration::from_secs(5));
+            if Device::state(&device).unwrap_or(0) != 100
+                || Device::device_type(&device).unwrap_or(0) != 2
+            {
+                continue;
+            }
+            let access_point_path = match DeviceWireless::active_access_point(&device) {
+                Ok(path) if path != DBUS_ROOT => path,
+                _ => continue,
+            };
+            let interface = Device::interface(&device)
+                .map_err(|error| nm_error("read the active Wi-Fi interface", error))?;
+            let access_point =
+                connection.with_proxy(NM_BUS, access_point_path, Duration::from_secs(5));
+            let ssid = AccessPoint::ssid(&access_point)
+                .map_err(|error| nm_error("read the active Wi-Fi identity", error))?;
+            let wpa_flags = AccessPoint::wpa_flags(&access_point)
+                .map_err(|error| nm_error("read Wi-Fi WPA capabilities", error))?;
+            let rsn_flags = AccessPoint::rsn_flags(&access_point)
+                .map_err(|error| nm_error("read Wi-Fi RSN capabilities", error))?;
+            let mut identity = interface.into_bytes();
+            identity.push(0);
+            identity.extend_from_slice(&ssid);
+            observations.push(WifiSecurityObservation {
+                identity,
+                secure: wifi_is_secure(wpa_flags, rsn_flags),
+            });
+        }
+        observations.sort_by(|left, right| left.identity.cmp(&right.identity));
+        Ok(observations.into_iter().next())
+    }
+
     pub fn conflicting_interfaces(&self) -> NativeResult<Vec<String>> {
         let connection = system_bus()?;
         let root = connection.with_proxy(NM_BUS, NM_PATH, Duration::from_secs(5));
@@ -1754,6 +1802,11 @@ fn normalize_protocol(protocol: &str) -> String {
     .to_owned()
 }
 
+fn wifi_is_secure(wpa_flags: u32, rsn_flags: u32) -> bool {
+    // Open and legacy WEP access points expose neither WPA nor RSN key-management flags.
+    wpa_flags != 0 || rsn_flags != 0
+}
+
 fn nm_error(action: &str, error: dbus::Error) -> NativeError {
     NativeError::new(
         "networkmanager_error",
@@ -1766,6 +1819,14 @@ fn nm_error(action: &str, error: dbus::Error) -> NativeError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wifi_security_requires_wpa_or_rsn_key_management() {
+        assert!(!wifi_is_secure(0, 0));
+        assert!(wifi_is_secure(1, 0));
+        assert!(wifi_is_secure(0, 1));
+        assert!(wifi_is_secure(1, 1));
+    }
 
     #[test]
     fn wireguard_key_conversion_is_deterministic_and_32_bytes() {

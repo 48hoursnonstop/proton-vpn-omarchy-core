@@ -46,7 +46,8 @@ async fn main() -> io::Result<()> {
         config.notification_command,
         config.status_icon_dir,
     );
-    let backend = native_backend::spawn(state_tx, operations.clone(), store.clone());
+    let backend = native_backend::spawn(state_tx.clone(), operations.clone(), store.clone());
+    native_backend::spawn_lifecycle(state_tx, backend.clone(), store.clone());
     autoconnect::spawn(backend.clone(), store.clone(), state_rx.clone());
 
     tokio::select! {

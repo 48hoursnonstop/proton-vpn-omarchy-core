@@ -276,11 +276,24 @@ pub struct StateSnapshot {
     pub connection: ConnectionState,
     #[serde(default)]
     pub device_location: DeviceLocationState,
+    #[serde(default)]
+    pub network_security: NetworkSecurityState,
     pub features: FeatureState,
     #[serde(default)]
     pub operations: OperationState,
     #[serde(default)]
     pub store: CanonicalStoreState,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct NetworkSecurityState {
+    /// Whether NetworkManager has supplied a current observation.
+    pub known: bool,
+    pub wifi_connected: bool,
+    pub insecure_wifi: bool,
+    /// Changes whenever the active Wi-Fi network or its security changes.
+    /// The SSID deliberately remains private to the agent.
+    pub generation: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

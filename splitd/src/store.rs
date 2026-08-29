@@ -1,4 +1,7 @@
-use crate::model::{validate_ip_ranges, ConfigMap, PolicyMap, MAX_CONFIGS};
+use crate::{
+    model::{validate_ip_ranges, ConfigMap, PolicyMap, MAX_CONFIGS},
+    routing::PhysicalRoute,
+};
 use serde::{Deserialize, Serialize};
 use std::{
     fs::{self, File, OpenOptions},
@@ -7,7 +10,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-const SCHEMA_VERSION: u32 = 1;
+const SCHEMA_VERSION: u32 = 2;
 const MAX_STATE_BYTES: u64 = 2 * 1024 * 1024;
 pub const DEFAULT_STATE_PATH: &str = "/var/lib/proton-vpn-omarchy/split-tunneling-v1.json";
 
@@ -23,12 +26,15 @@ struct StoredState {
     configs: ConfigMap,
     #[serde(default)]
     destination_policies: PolicyMap,
+    #[serde(default)]
+    kill_switch_bypass: std::collections::BTreeMap<u16, Vec<PhysicalRoute>>,
 }
 
 #[derive(Debug, Default)]
 pub struct LoadedState {
     pub configs: ConfigMap,
     pub destination_policies: PolicyMap,
+    pub kill_switch_bypass: std::collections::BTreeMap<u16, Vec<PhysicalRoute>>,
 }
 
 impl StateStore {
@@ -69,7 +75,7 @@ impl StateStore {
             .map_err(|error| with_path("read state", path, error))?;
         let stored: StoredState = serde_json::from_slice(&bytes)
             .map_err(|error| invalid_state(path, &format!("invalid JSON: {error}")))?;
-        if stored.schema_version != SCHEMA_VERSION {
+        if !matches!(stored.schema_version, 1 | SCHEMA_VERSION) {
             return Err(invalid_state(
                 path,
                 &format!("unsupported schema version {}", stored.schema_version),
@@ -97,13 +103,53 @@ impl StateStore {
                     .map_err(|error| invalid_state(path, &format!("UID {uid} policy: {error}")))
             })
             .collect::<io::Result<PolicyMap>>()?;
+        let kill_switch_bypass = stored
+            .kill_switch_bypass
+            .into_iter()
+            .map(|(uid, routes)| {
+                if routes.is_empty() || routes.len() > 2 {
+                    return Err(invalid_state(
+                        path,
+                        &format!("UID {uid} has an invalid bypass-route count"),
+                    ));
+                }
+                if !configs.get(&uid).is_some_and(|config| config.has_rules()) {
+                    return Err(invalid_state(
+                        path,
+                        &format!("UID {uid} has bypass routes without a split policy"),
+                    ));
+                }
+                let routes = routes
+                    .iter()
+                    .map(PhysicalRoute::validated)
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| invalid_state(path, &format!("UID {uid}: {error}")))?;
+                let families = routes
+                    .iter()
+                    .map(|route| route.family)
+                    .collect::<std::collections::BTreeSet<_>>();
+                if families.len() != routes.len() {
+                    return Err(invalid_state(
+                        path,
+                        &format!("UID {uid} has duplicate bypass-route families"),
+                    ));
+                }
+                Ok((uid, routes))
+            })
+            .collect::<io::Result<std::collections::BTreeMap<_, _>>>()?;
         Ok(LoadedState {
             configs,
             destination_policies,
+            kill_switch_bypass,
         })
     }
 
-    pub fn save(&self, configs: &ConfigMap, destination_policies: &PolicyMap) -> io::Result<()> {
+    pub fn save(
+        &self,
+        configs: &ConfigMap,
+        destination_policies: &PolicyMap,
+        kill_switch_bypass: &std::collections::BTreeMap<u16, Vec<PhysicalRoute>>,
+    ) -> io::Result<()> {
         let Some(path) = &self.path else {
             return Ok(());
         };
@@ -119,6 +165,7 @@ impl StateStore {
             schema_version: SCHEMA_VERSION,
             configs: configs.clone(),
             destination_policies: destination_policies.clone(),
+            kill_switch_bypass: kill_switch_bypass.clone(),
         };
         let bytes = serde_json::to_vec_pretty(&stored)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
@@ -209,10 +256,15 @@ mod tests {
             },
         )]);
         let policies = PolicyMap::from([(1000, vec!["192.168.0.0/16".into(), "fe80::/10".into()])]);
-        store.save(&configs, &policies).unwrap();
+        let bypass = std::collections::BTreeMap::from([(
+            1000,
+            vec![PhysicalRoute::parse("ipv4", "192.0.2.1", "wlan0").unwrap()],
+        )]);
+        store.save(&configs, &policies, &bypass).unwrap();
         let loaded = store.load().unwrap();
         assert_eq!(loaded.configs, configs);
         assert_eq!(loaded.destination_policies, policies);
+        assert_eq!(loaded.kill_switch_bypass, bypass);
         assert_eq!(
             fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600

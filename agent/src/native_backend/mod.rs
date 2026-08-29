@@ -3,6 +3,7 @@ mod api;
 mod apps;
 mod catalog;
 mod fido2;
+mod lifecycle;
 mod local_agent;
 mod models;
 mod network;
@@ -245,6 +246,14 @@ pub fn spawn(
     };
     tokio::spawn(run(rx, events));
     BackendHandle::new(tx, operations, BackendFlavor::Native)
+}
+
+pub fn spawn_lifecycle(
+    state_tx: watch::Sender<StateSnapshot>,
+    backend: BackendHandle,
+    store: StoreHandle,
+) {
+    lifecycle::spawn(state_tx, backend, store, NetworkManagerBackend);
 }
 
 async fn run(mut rx: mpsc::Receiver<BackendRequest>, events: EventSink) {
