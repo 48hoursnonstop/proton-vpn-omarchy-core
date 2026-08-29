@@ -10,9 +10,10 @@ use std::{
 
 const ROUTE_TABLE_BASE: u32 = 30_000;
 const RULE_PRIORITY_BASE: u32 = 12_000;
-// Private protocol tag used only as an additional ownership assertion. Cleanup
-// still deletes each exact tracked route and never flushes a whole table.
-const ROUTE_PROTOCOL: u32 = 186;
+// Private protocol tag used only as an additional ownership assertion. 242 is
+// outside iproute2's named routing protocols; cleanup still deletes each exact
+// tracked route and never treats this value as globally exclusive.
+const ROUTE_PROTOCOL: u32 = 242;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -442,7 +443,7 @@ mod tests {
             assert!(command
                 .delete
                 .windows(2)
-                .any(|pair| pair == ["proto", "186"]));
+                .any(|pair| pair == ["proto", "242"]));
             assert!(!command.delete.iter().any(|value| value == "flush"));
         }
     }
@@ -460,12 +461,12 @@ mod tests {
     #[test]
     fn ownership_verification_rejects_extra_or_foreign_routes() {
         let owned = br#"[
-          {"dst":"192.0.2.1/32","dev":"wlan0","protocol":186},
-          {"dst":"default","gateway":"192.0.2.1","dev":"wlan0","protocol":"186"}
+          {"dst":"192.0.2.1/32","dev":"wlan0","protocol":242},
+          {"dst":"default","gateway":"192.0.2.1","dev":"wlan0","protocol":"242"}
         ]"#;
         let with_foreign = br#"[
-          {"dst":"192.0.2.1/32","dev":"wlan0","protocol":186},
-          {"dst":"default","gateway":"192.0.2.1","dev":"wlan0","protocol":"186"},
+          {"dst":"192.0.2.1/32","dev":"wlan0","protocol":242},
+          {"dst":"default","gateway":"192.0.2.1","dev":"wlan0","protocol":"242"},
           {"dst":"203.0.113.0/24","dev":"eth0","protocol":"static"}
         ]"#;
         assert!(route_inventory_is_owned(owned, 2).unwrap());
