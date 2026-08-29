@@ -20,7 +20,7 @@ makedepends=('rust>=1.75')
 options=('!debug' '!lto')
 install=proton-vpn-omarchy.install
 source=("$pkgname-$pkgver.tar.gz")
-sha256sums=('SKIP')
+sha256sums=('dddfc25b25433d42870fe148f539343f5fc42fd949419f4eb1410067da48cd23')
 
 build() {
   cd "$pkgname-$pkgver"
