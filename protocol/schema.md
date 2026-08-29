@@ -483,4 +483,8 @@ are rejected for Free-tier accounts instead of being silently ignored by the loc
 
 ### Anonymous crash reports
 
-`features.anonymous_crash_reports.enabled` reports the persisted frozen Proton Linux `anonymous_crash_reports` setting. `features.writes.anonymous_crash_reports` advertises whether the signed-in Linux backend can apply the setting through the public `ProtonVPNAPI.save_settings()` path. `feature.set` uses `feature="anonymous_crash_reports"` and a boolean `value`. This controls frozen Linux error/crash UsageReporting only; it is not the separate Windows anonymous usage-statistics preference.
+`features.anonymous_crash_reports.enabled` remains false and
+`features.writes.anonymous_crash_reports` remains false. The native Rust agent
+does not currently contain a crash-capture/upload implementation, so it must
+not expose a switch that implies reports are being sent. Anonymous connection
+statistics are a separate, explicit opt-in preference.

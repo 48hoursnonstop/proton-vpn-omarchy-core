@@ -85,7 +85,11 @@ impl SplitConfig {
         self.app_paths
             .iter()
             .filter(|path| !path.is_empty())
-            .any(|path| identities.iter().any(|identity| identity.starts_with(path)))
+            .any(|path| {
+                identities
+                    .iter()
+                    .any(|identity| identity_matches_path(identity, path))
+            })
     }
 
     pub fn excludes(&self, matched: bool) -> bool {
@@ -94,6 +98,13 @@ impl SplitConfig {
             SplitMode::Include => !matched,
         }
     }
+}
+
+fn identity_matches_path(identity: &str, path: &str) -> bool {
+    identity == path
+        || identity
+            .strip_prefix(path)
+            .is_some_and(|suffix| suffix.starts_with(char::is_whitespace))
 }
 
 pub type ConfigMap = BTreeMap<u16, SplitConfig>;
@@ -177,6 +188,18 @@ mod tests {
         };
         assert!(config.matches(&["/usr/bin/proton-omarchy-agent".into()]));
         assert!(!config.excludes(true));
+    }
+
+    #[test]
+    fn executable_paths_match_only_at_argument_boundaries() {
+        let config = SplitConfig {
+            mode: SplitMode::Exclude,
+            app_paths: vec!["/usr/bin/fire".into()],
+            ip_ranges: vec![],
+        };
+        assert!(config.matches(&["/usr/bin/fire --private".into()]));
+        assert!(config.matches(&["/usr/bin/fire".into()]));
+        assert!(!config.matches(&["/usr/bin/firefox".into()]));
     }
 
     #[test]

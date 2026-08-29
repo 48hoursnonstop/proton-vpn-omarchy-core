@@ -1,7 +1,7 @@
 {
   "checkpoint": "0.8.9-windows-parity-follow-up",
   "audited_at": "2026-08-28",
-  "decision": "COMPLETE_TO_DECLARED_PRODUCT_SCOPE",
+  "decision": "COMPLETE_TO_DECLARED_PRODUCT_SCOPE_EXCEPT_CRASH_UPLOAD",
   "backend": {
     "only": "native_rust_v2",
     "legacy_fallback": null,
@@ -46,7 +46,8 @@
     "local_area_network_access_policy": "IMPLEMENTED",
     "local_dns_and_multicast_name_access_policy": "IMPLEMENTED",
     "account_upgrade_support_report_diagnostics_about": "IMPLEMENTED",
-    "anonymous_crash_and_usage_preferences": "IMPLEMENTED",
+    "anonymous_usage_statistics_preference": "IMPLEMENTED_OPT_IN",
+    "anonymous_crash_reports": "DISABLED_NO_CRASH_TRANSMITTER",
     "spanish_english_inline_feedback": "IMPLEMENTED",
     "android_monochrome_status_notifications": "IMPLEMENTED",
     "recoverable_typed_operations_and_duplicate_action_gates": "IMPLEMENTED",

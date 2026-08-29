@@ -72,5 +72,7 @@ package() {
     "$pkgdir/usr/share/doc/$pkgname/capability-boundaries.json"
   install -Dm644 reference/plugin-feature-completeness-2026-08-26.json \
     "$pkgdir/usr/share/doc/$pkgname/feature-completeness.json"
+  install -Dm644 reference/SECURITY_AUDIT_2026-08-28.md \
+    "$pkgdir/usr/share/doc/$pkgname/security-audit.md"
   install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
 }

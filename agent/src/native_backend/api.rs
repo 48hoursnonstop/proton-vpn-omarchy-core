@@ -653,6 +653,7 @@ fn build_api_client(
         .https_only(true)
         .cookie_provider(cookie_jar)
         .tls_info(true)
+        .redirect(reqwest::redirect::Policy::none())
         .danger_accept_invalid_certs(accept_pinned_name_mismatch)
         .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(30))

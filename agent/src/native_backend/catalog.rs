@@ -12,6 +12,7 @@ use std::{
     cmp::Ordering,
     collections::{BTreeMap, BTreeSet},
     fs,
+    io::Read,
     path::Path,
 };
 
@@ -23,7 +24,8 @@ pub struct ConnectionTarget {
 
 impl ServerCatalog {
     pub fn load(path: &Path) -> NativeResult<Self> {
-        let raw = fs::read(path).map_err(|error| {
+        const MAX_CATALOG_BYTES: u64 = 8 * 1024 * 1024;
+        let metadata = fs::metadata(path).map_err(|error| {
             NativeError::new(
                 "catalog_unavailable",
                 format!(
@@ -34,6 +36,32 @@ impl ServerCatalog {
             .with_source(error)
             .retryable(true)
         })?;
+        if metadata.len() > MAX_CATALOG_BYTES {
+            return Err(NativeError::new(
+                "catalog_invalid",
+                "The Proton server catalog exceeds the size limit",
+            ));
+        }
+        let mut raw = Vec::with_capacity(metadata.len() as usize);
+        fs::File::open(path)
+            .and_then(|file| file.take(MAX_CATALOG_BYTES + 1).read_to_end(&mut raw))
+            .map_err(|error| {
+                NativeError::new(
+                    "catalog_unavailable",
+                    format!(
+                        "The Proton server catalog is unavailable at {}",
+                        path.display()
+                    ),
+                )
+                .with_source(error)
+                .retryable(true)
+            })?;
+        if raw.len() > MAX_CATALOG_BYTES as usize {
+            return Err(NativeError::new(
+                "catalog_invalid",
+                "The Proton server catalog exceeds the size limit",
+            ));
+        }
         serde_json::from_slice(&raw).map_err(|error| {
             NativeError::new("catalog_invalid", "The Proton server catalog is invalid")
                 .with_source(error)

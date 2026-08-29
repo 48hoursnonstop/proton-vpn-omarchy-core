@@ -1,15 +1,25 @@
 use super::{NativeError, NativeResult};
-use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
-use std::{fs, os::unix::fs::PermissionsExt, path::PathBuf, process::Stdio, time::Duration};
-use tokio::{net::TcpListener, process::Child};
-use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
+use std::{
+    fs, io,
+    os::{
+        fd::{AsRawFd, FromRawFd, OwnedFd},
+        unix::{fs::PermissionsExt, net::UnixStream as StdUnixStream},
+    },
+    path::PathBuf,
+    process::Stdio,
+    time::Duration,
+};
+use tokio::{
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
+    net::UnixStream,
+    process::Child,
+};
 
-const BROWSER_START_TIMEOUT: Duration = Duration::from_secs(12);
+const BROWSER_START_TIMEOUT: Duration = Duration::from_secs(30);
 const SSO_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const CAPTCHA_TIMEOUT: Duration = Duration::from_secs(10 * 60);
-
-type DevToolsSocket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
+const MAX_CDP_MESSAGE_BYTES: usize = 1024 * 1024;
 
 pub async fn complete_sso(challenge: &str, uid: &str, access_token: &str) -> NativeResult<String> {
     let mut url = reqwest::Url::parse("https://vpn-api.proton.me/auth/sso/")
@@ -146,7 +156,6 @@ struct BrowserSession {
 
 impl BrowserSession {
     async fn open() -> NativeResult<(Self, CdpClient)> {
-        let port = available_local_port().await?;
         let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(std::env::temp_dir);
@@ -169,10 +178,53 @@ impl BrowserSession {
             )
         })?;
 
-        let mut child = tokio::process::Command::new("/usr/bin/brave-origin")
+        let (command_parent, command_child) = StdUnixStream::pair().map_err(|error| {
+            web_error(
+                "web_auth_unavailable",
+                "Unable to create the private browser command pipe",
+                error,
+            )
+        })?;
+        let (response_parent, response_child) = StdUnixStream::pair().map_err(|error| {
+            web_error(
+                "web_auth_unavailable",
+                "Unable to create the private browser response pipe",
+                error,
+            )
+        })?;
+        command_parent.set_nonblocking(true).map_err(|error| {
+            web_error(
+                "web_auth_unavailable",
+                "Invalid browser command pipe",
+                error,
+            )
+        })?;
+        response_parent.set_nonblocking(true).map_err(|error| {
+            web_error(
+                "web_auth_unavailable",
+                "Invalid browser response pipe",
+                error,
+            )
+        })?;
+        let command_child = duplicate_above_stdio(&command_child).map_err(|error| {
+            web_error(
+                "web_auth_unavailable",
+                "Invalid browser command pipe",
+                error,
+            )
+        })?;
+        let response_child = duplicate_above_stdio(&response_child).map_err(|error| {
+            web_error(
+                "web_auth_unavailable",
+                "Invalid browser response pipe",
+                error,
+            )
+        })?;
+
+        let mut command = tokio::process::Command::new("/usr/bin/brave-origin");
+        command
             .arg(format!("--user-data-dir={}", profile_dir.display()))
-            .arg(format!("--remote-debugging-port={port}"))
-            .arg("--remote-debugging-address=127.0.0.1")
+            .arg("--remote-debugging-pipe")
             .arg("--no-first-run")
             .arg("--no-default-browser-check")
             .arg("--disable-sync")
@@ -180,40 +232,49 @@ impl BrowserSession {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(|error| {
-                web_error(
-                    "web_auth_unavailable",
-                    "Unable to start the isolated Brave window",
-                    error,
-                )
-            })?;
-
-        let websocket_url = match discover_page(port, &mut child).await {
-            Ok(value) => value,
-            Err(error) => {
-                let _ = child.start_kill();
-                let _ = fs::remove_dir_all(&profile_dir);
-                return Err(error);
-            }
-        };
-        let (socket, _) = match connect_async(&websocket_url).await {
-            Ok(socket) => socket,
-            Err(error) => {
-                let _ = child.start_kill();
-                let _ = fs::remove_dir_all(&profile_dir);
-                return Err(web_error(
-                    "web_auth_unavailable",
-                    "Unable to control the isolated Brave window",
-                    error,
-                ));
-            }
-        };
-        Ok((
-            Self { child, profile_dir },
-            CdpClient { socket, next_id: 1 },
-        ))
+            .kill_on_drop(true);
+        // Chromium reserves fd 3 for CDP commands and fd 4 for responses when
+        // --remote-debugging-pipe is used. The source descriptors are >= 5 so
+        // stdio setup cannot overwrite them before this child-only hook runs.
+        unsafe {
+            command.pre_exec(move || {
+                if libc::dup2(command_child.as_raw_fd(), 3) == -1 {
+                    return Err(io::Error::last_os_error());
+                }
+                if libc::dup2(response_child.as_raw_fd(), 4) == -1 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = command.spawn().map_err(|error| {
+            web_error(
+                "web_auth_unavailable",
+                "Unable to start the isolated Brave window",
+                error,
+            )
+        })?;
+        let command_writer = UnixStream::from_std(command_parent).map_err(|error| {
+            web_error(
+                "web_auth_unavailable",
+                "Invalid browser command pipe",
+                error,
+            )
+        })?;
+        let response_reader = UnixStream::from_std(response_parent).map_err(|error| {
+            web_error(
+                "web_auth_unavailable",
+                "Invalid browser response pipe",
+                error,
+            )
+        })?;
+        let mut cdp = CdpClient::new(response_reader, command_writer);
+        if let Err(error) = attach_page(&mut cdp, &mut child).await {
+            let _ = child.start_kill();
+            let _ = fs::remove_dir_all(&profile_dir);
+            return Err(error);
+        }
+        Ok((Self { child, profile_dir }, cdp))
     }
 
     async fn cleanup(&mut self) {
@@ -231,13 +292,46 @@ impl Drop for BrowserSession {
 }
 
 struct CdpClient {
-    socket: DevToolsSocket,
+    reader: UnixStream,
+    writer: UnixStream,
+    read_buffer: Vec<u8>,
     next_id: u64,
+    session_id: Option<String>,
 }
 
 impl CdpClient {
+    fn new(reader: UnixStream, writer: UnixStream) -> Self {
+        Self {
+            reader,
+            writer,
+            read_buffer: Vec::new(),
+            next_id: 1,
+            session_id: None,
+        }
+    }
+
     async fn command(&mut self, method: &str, params: Value) -> NativeResult<Value> {
-        let id = self.send(method, params).await?;
+        if self.session_id.is_none() {
+            return Err(NativeError::new(
+                "web_auth_failed",
+                "The browser page is not attached",
+            ));
+        }
+        self.command_with_session(method, params, self.session_id.clone())
+            .await
+    }
+
+    async fn root_command(&mut self, method: &str, params: Value) -> NativeResult<Value> {
+        self.command_with_session(method, params, None).await
+    }
+
+    async fn command_with_session(
+        &mut self,
+        method: &str,
+        params: Value,
+        session_id: Option<String>,
+    ) -> NativeResult<Value> {
+        let id = self.send_with_session(method, params, session_id).await?;
         loop {
             let message = self.next_message().await?;
             if message.get("id").and_then(Value::as_u64) != Some(id) {
@@ -254,14 +348,31 @@ impl CdpClient {
     }
 
     async fn send(&mut self, method: &str, params: Value) -> NativeResult<u64> {
+        if self.session_id.is_none() {
+            return Err(NativeError::new(
+                "web_auth_failed",
+                "The browser page is not attached",
+            ));
+        }
+        self.send_with_session(method, params, self.session_id.clone())
+            .await
+    }
+
+    async fn send_with_session(
+        &mut self,
+        method: &str,
+        params: Value,
+        session_id: Option<String>,
+    ) -> NativeResult<u64> {
         let id = self.next_id;
         self.next_id = self.next_id.wrapping_add(1);
-        self.socket
-            .send(Message::Text(
-                json!({ "id": id, "method": method, "params": params })
-                    .to_string()
-                    .into(),
-            ))
+        let mut message = json!({ "id": id, "method": method, "params": params });
+        if let Some(session_id) = session_id {
+            message["sessionId"] = Value::String(session_id);
+        }
+        let payload = serde_json::to_vec(&message)
+            .map_err(|error| web_error("web_auth_failed", "Invalid browser command", error))?;
+        write_pipe_message(&mut self.writer, &payload)
             .await
             .map_err(|error| web_error("web_auth_failed", "Browser channel failed", error))?;
         Ok(id)
@@ -270,57 +381,35 @@ impl CdpClient {
     async fn next_event(&mut self) -> NativeResult<Value> {
         loop {
             let message = self.next_message().await?;
-            if message.get("method").is_some() {
+            if message.get("method").is_some()
+                && message.get("sessionId").and_then(Value::as_str) == self.session_id.as_deref()
+            {
                 return Ok(message);
             }
         }
     }
 
     async fn next_message(&mut self) -> NativeResult<Value> {
-        while let Some(message) = self.socket.next().await {
-            let message = message
-                .map_err(|error| web_error("web_auth_failed", "Browser channel failed", error))?;
-            if let Message::Text(text) = message {
-                return serde_json::from_str(text.as_str()).map_err(|error| {
-                    web_error(
-                        "web_auth_failed",
-                        "Browser returned an invalid control message",
-                        error,
-                    )
-                });
-            }
-        }
-        Err(NativeError::new(
-            "web_auth_cancelled",
-            "The isolated browser window was closed",
-        ))
+        let bytes = read_pipe_message(&mut self.reader, &mut self.read_buffer).await?;
+        serde_json::from_slice(&bytes).map_err(|error| {
+            web_error(
+                "web_auth_failed",
+                "Browser returned an invalid control message",
+                error,
+            )
+        })
     }
 }
 
-async fn available_local_port() -> NativeResult<u16> {
-    let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
-        .await
-        .map_err(|error| {
-            web_error(
-                "web_auth_unavailable",
-                "Unable to allocate a local browser control port",
-                error,
-            )
-        })?;
-    listener
-        .local_addr()
-        .map(|address| address.port())
-        .map_err(|error| web_error("web_auth_unavailable", "Invalid local control port", error))
+fn duplicate_above_stdio(stream: &StdUnixStream) -> io::Result<OwnedFd> {
+    let descriptor = unsafe { libc::fcntl(stream.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 5) };
+    if descriptor == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe { OwnedFd::from_raw_fd(descriptor) })
 }
 
-async fn discover_page(port: u16, child: &mut Child) -> NativeResult<String> {
-    let client = reqwest::Client::builder()
-        .no_proxy()
-        .connect_timeout(Duration::from_secs(1))
-        .timeout(Duration::from_secs(1))
-        .build()
-        .map_err(|error| web_error("web_auth_unavailable", "Local browser client failed", error))?;
-    let endpoint = format!("http://127.0.0.1:{port}/json/list");
+async fn attach_page(cdp: &mut CdpClient, child: &mut Child) -> NativeResult<()> {
     tokio::time::timeout(BROWSER_START_TIMEOUT, async {
         loop {
             if let Some(status) = child.try_wait().map_err(|error| {
@@ -331,16 +420,17 @@ async fn discover_page(port: u16, child: &mut Child) -> NativeResult<String> {
                     format!("The isolated Brave window exited with {status}"),
                 ));
             }
-            if let Ok(response) = client.get(&endpoint).send().await {
-                if let Ok(targets) = response.json::<Vec<Value>>().await {
-                    if let Some(url) = targets.iter().find_map(|target| {
-                        (target.get("type").and_then(Value::as_str) == Some("page"))
-                            .then(|| target.get("webSocketDebuggerUrl").and_then(Value::as_str))
-                            .flatten()
-                            .map(str::to_owned)
-                    }) {
-                        return Ok(url);
-                    }
+            let targets = cdp.root_command("Target.getTargets", json!({})).await?;
+            if let Some(target_id) = page_target_id(&targets) {
+                let attached = cdp
+                    .root_command(
+                        "Target.attachToTarget",
+                        json!({ "targetId": target_id, "flatten": true }),
+                    )
+                    .await?;
+                if let Some(session_id) = attached.get("sessionId").and_then(Value::as_str) {
+                    cdp.session_id = Some(session_id.to_owned());
+                    return Ok(());
                 }
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -353,6 +443,65 @@ async fn discover_page(port: u16, child: &mut Child) -> NativeResult<String> {
             "The isolated Brave window did not become ready",
         )
     })?
+}
+
+fn page_target_id(targets: &Value) -> Option<&str> {
+    targets
+        .get("targetInfos")?
+        .as_array()?
+        .iter()
+        .find(|target| target.get("type").and_then(Value::as_str) == Some("page"))?
+        .get("targetId")?
+        .as_str()
+}
+
+async fn write_pipe_message<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    payload: &[u8],
+) -> io::Result<()> {
+    if payload.len() > MAX_CDP_MESSAGE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "browser command exceeds the size limit",
+        ));
+    }
+    writer.write_all(payload).await?;
+    writer.write_all(&[0]).await?;
+    writer.flush().await
+}
+
+async fn read_pipe_message<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    buffer: &mut Vec<u8>,
+) -> NativeResult<Vec<u8>> {
+    loop {
+        if let Some(end) = buffer.iter().position(|byte| *byte == 0) {
+            let mut message = buffer.drain(..=end).collect::<Vec<_>>();
+            message.pop();
+            if message.is_empty() {
+                continue;
+            }
+            return Ok(message);
+        }
+        let mut chunk = [0_u8; 8192];
+        let read = reader
+            .read(&mut chunk)
+            .await
+            .map_err(|error| web_error("web_auth_failed", "Browser channel failed", error))?;
+        if read == 0 {
+            return Err(NativeError::new(
+                "web_auth_cancelled",
+                "The isolated browser window was closed",
+            ));
+        }
+        if buffer.len().saturating_add(read) > MAX_CDP_MESSAGE_BYTES {
+            return Err(NativeError::new(
+                "web_auth_failed",
+                "Browser control message exceeds the size limit",
+            ));
+        }
+        buffer.extend_from_slice(&chunk[..read]);
+    }
 }
 
 fn header_array(headers: Option<&Value>) -> Vec<Value> {
@@ -407,7 +556,11 @@ fn navigation_urls<'a>(method: &str, params: &'a Value) -> Vec<&'a str> {
 
 fn sso_callback_token(candidate: &str, expected_uid: &str) -> Option<String> {
     let url = reqwest::Url::parse(candidate).ok()?;
-    if !url.path().ends_with("/sso/login") {
+    if url.scheme() != "https"
+        || url.host_str() != Some("vpn-api.proton.me")
+        || url.port_or_known_default() != Some(443)
+        || url.path() != "/sso/login"
+    {
         return None;
     }
     let values = url::form_urlencoded::parse(url.fragment()?.as_bytes())
@@ -459,6 +612,16 @@ mod tests {
             Some("response+token")
         );
         assert!(sso_callback_token(url, "uid-2").is_none());
+        assert!(sso_callback_token(
+            "https://example.test/sso/login#token=forged&uid=uid-1",
+            "uid-1"
+        )
+        .is_none());
+        assert!(sso_callback_token(
+            "http://vpn-api.proton.me/sso/login#token=forged&uid=uid-1",
+            "uid-1"
+        )
+        .is_none());
     }
 
     #[test]
@@ -468,5 +631,46 @@ mod tests {
             Some("ok")
         );
         assert!(captcha_response_token(r#"{"type":"height","height":400}"#).is_none());
+    }
+
+    #[test]
+    fn page_target_selection_ignores_non_page_targets() {
+        let targets = json!({
+            "targetInfos": [
+                { "type": "service_worker", "targetId": "worker" },
+                { "type": "page", "targetId": "page-1" }
+            ]
+        });
+        assert_eq!(page_target_id(&targets), Some("page-1"));
+    }
+
+    #[tokio::test]
+    async fn pipe_messages_are_nul_delimited_and_bounded() {
+        let (mut writer, mut reader) = tokio::io::duplex(64);
+        write_pipe_message(&mut writer, br#"{"id":1}"#)
+            .await
+            .expect("write frame");
+        let mut buffer = Vec::new();
+        assert_eq!(
+            read_pipe_message(&mut reader, &mut buffer)
+                .await
+                .expect("read frame"),
+            br#"{"id":1}"#
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "launches the installed Brave browser"]
+    async fn browser_pipe_attaches_without_opening_a_debug_port() {
+        let (mut browser, mut cdp) = BrowserSession::open().await.expect("open Brave pipe");
+        let result = cdp
+            .command(
+                "Runtime.evaluate",
+                json!({ "expression": "6 * 7", "returnByValue": true }),
+            )
+            .await
+            .expect("evaluate expression");
+        assert_eq!(result["result"]["value"], 42);
+        browser.cleanup().await;
     }
 }

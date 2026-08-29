@@ -2,7 +2,7 @@ use super::{models::NativeSettings, NativeError, NativeResult};
 use std::{
     fs::{self, OpenOptions},
     io::Write,
-    os::unix::fs::{OpenOptionsExt, PermissionsExt},
+    os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
 };
@@ -43,11 +43,6 @@ fn save_serialized<T: serde::Serialize>(path: &Path, settings: &T) -> NativeResu
             .and_then(|_| file.sync_all())
             .map_err(|error| settings_error("write", &temp, error))?;
 
-        let mode = fs::metadata(path)
-            .map(|metadata| metadata.permissions().mode() & 0o777)
-            .unwrap_or(0o600);
-        fs::set_permissions(&temp, fs::Permissions::from_mode(mode))
-            .map_err(|error| settings_error("set permissions on", &temp, error))?;
         fs::rename(&temp, path).map_err(|error| settings_error("replace", path, error))?;
 
         if let Ok(directory) = OpenOptions::new().read(true).open(parent) {
@@ -98,6 +93,32 @@ mod tests {
         let loaded: NativeSettings =
             serde_json::from_slice(&fs::read(&path).expect("read")).expect("parse");
         assert_eq!(loaded.extra["FutureSetting"]["enabled"], true);
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            fs::metadata(&path).expect("metadata").permissions().mode() & 0o777,
+            0o600
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn save_repairs_an_overly_permissive_existing_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "proton-omarchy-settings-mode-test-{}-{}",
+            std::process::id(),
+            TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).expect("create root");
+        let path = root.join("settings.json");
+        fs::write(&path, b"{}\n").expect("write old settings");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).expect("set old mode");
+        save(&path, &NativeSettings::default()).expect("replace settings");
+        assert_eq!(
+            fs::metadata(&path).expect("metadata").permissions().mode() & 0o777,
+            0o600
+        );
         fs::remove_dir_all(root).expect("cleanup");
     }
 }

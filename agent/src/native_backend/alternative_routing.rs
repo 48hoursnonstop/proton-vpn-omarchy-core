@@ -6,6 +6,7 @@ use std::{net::SocketAddr, time::Duration};
 
 const API_HOST: &str = "vpn-api.proton.me";
 const AR_SUFFIX: &str = ".protonpro.xyz";
+const MAX_DNS_RESPONSE_BYTES: usize = u16::MAX as usize;
 
 #[derive(Clone, Debug)]
 pub struct AlternativeRoute {
@@ -60,6 +61,7 @@ async fn query_provider(
     })?;
     let client = reqwest::Client::builder()
         .https_only(true)
+        .redirect(reqwest::redirect::Policy::none())
         .resolve(provider_host, socket)
         .connect_timeout(Duration::from_secs(4))
         .timeout(Duration::from_secs(8))
@@ -71,7 +73,7 @@ async fn query_provider(
             )
             .with_source(error)
         })?;
-    let response = client
+    let mut response = client
         .post(format!("https://{provider_host}/dns-query"))
         .header(header::CONTENT_TYPE, "application/dns-message")
         .header(header::ACCEPT, "application/dns-message")
@@ -96,13 +98,25 @@ async fn query_provider(
         )
         .retryable(response.status().is_server_error()));
     }
-    let bytes = response.bytes().await.map_err(|error| {
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_DNS_RESPONSE_BYTES as u64)
+    {
+        return Err(invalid_dns_response("DNS response exceeds the size limit"));
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|error| {
         NativeError::new(
             "alternative_routing_response_invalid",
             "The DNS-over-HTTPS response could not be read",
         )
         .with_source(error)
-    })?;
+    })? {
+        if bytes.len().saturating_add(chunk.len()) > MAX_DNS_RESPONSE_BYTES {
+            return Err(invalid_dns_response("DNS response exceeds the size limit"));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
     parse_txt_response(&bytes)
 }
 

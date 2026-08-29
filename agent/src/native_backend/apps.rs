@@ -3,11 +3,16 @@ use serde_json::{json, Value};
 use std::{
     collections::{HashMap, HashSet},
     env, fs,
-    os::unix::fs::PermissionsExt,
+    io::Read,
+    os::unix::fs::{MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
 };
 
 const MAX_RESULTS: usize = 100;
+const MAX_QUERY_BYTES: usize = 256;
+const MAX_DESKTOP_FILES: usize = 10_000;
+const MAX_DESKTOP_DEPTH: usize = 32;
+const MAX_DESKTOP_FILE_BYTES: u64 = 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct InstalledApp {
@@ -23,8 +28,14 @@ pub fn list(params: &Value) -> NativeResult<Value> {
         .get("query")
         .and_then(Value::as_str)
         .unwrap_or("")
-        .trim()
-        .to_lowercase();
+        .trim();
+    if query.len() > MAX_QUERY_BYTES {
+        return Err(NativeError::new(
+            "invalid_params",
+            format!("query must be at most {MAX_QUERY_BYTES} bytes"),
+        ));
+    }
+    let query = query.to_lowercase();
 
     let mut by_executable = HashMap::new();
     for path in desktop_files() {
@@ -78,23 +89,51 @@ fn desktop_files() -> Vec<PathBuf> {
     roots.extend(env::split_paths(&data_dirs).map(|path| path.join("applications")));
 
     let mut files = Vec::new();
-    let mut seen = HashSet::new();
+    let mut seen_files = HashSet::new();
+    let mut seen_directories = HashSet::new();
     for root in roots {
-        collect_desktop_files(&root, &mut files, &mut seen);
+        let root = fs::canonicalize(&root).unwrap_or(root);
+        collect_desktop_files(&root, &mut files, &mut seen_files, &mut seen_directories, 0);
+        if files.len() >= MAX_DESKTOP_FILES {
+            break;
+        }
     }
     files
 }
 
-fn collect_desktop_files(root: &Path, files: &mut Vec<PathBuf>, seen: &mut HashSet<PathBuf>) {
+fn collect_desktop_files(
+    root: &Path,
+    files: &mut Vec<PathBuf>,
+    seen_files: &mut HashSet<PathBuf>,
+    seen_directories: &mut HashSet<(u64, u64)>,
+    depth: usize,
+) {
+    if depth > MAX_DESKTOP_DEPTH || files.len() >= MAX_DESKTOP_FILES {
+        return;
+    }
+    let Ok(metadata) = fs::metadata(root) else {
+        return;
+    };
+    if !metadata.is_dir() || !seen_directories.insert((metadata.dev(), metadata.ino())) {
+        return;
+    }
     let Ok(entries) = fs::read_dir(root) else {
         return;
     };
     for entry in entries.flatten() {
+        if files.len() >= MAX_DESKTOP_FILES {
+            break;
+        }
         let path = entry.path();
-        if path.is_dir() {
-            collect_desktop_files(&path, files, seen);
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        // Do not follow directory symlinks found below a trusted XDG root.
+        // They can form cycles or make a desktop scan traverse arbitrary trees.
+        if file_type.is_dir() {
+            collect_desktop_files(&path, files, seen_files, seen_directories, depth + 1);
         } else if path.extension().and_then(|value| value.to_str()) == Some("desktop")
-            && seen.insert(path.clone())
+            && seen_files.insert(path.clone())
         {
             files.push(path);
         }
@@ -102,7 +141,20 @@ fn collect_desktop_files(root: &Path, files: &mut Vec<PathBuf>, seen: &mut HashS
 }
 
 fn parse_desktop_file(path: &Path) -> Option<InstalledApp> {
-    let raw = fs::read_to_string(path).ok()?;
+    let metadata = fs::metadata(path).ok()?;
+    if !metadata.is_file() || metadata.len() > MAX_DESKTOP_FILE_BYTES {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    fs::File::open(path)
+        .ok()?
+        .take(MAX_DESKTOP_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() > MAX_DESKTOP_FILE_BYTES as usize {
+        return None;
+    }
+    let raw = String::from_utf8(bytes).ok()?;
     let mut in_desktop_entry = false;
     let mut values = HashMap::<String, String>::new();
     for raw_line in raw.lines() {
@@ -294,5 +346,47 @@ mod tests {
     #[test]
     fn desktop_escapes_are_decoded() {
         assert_eq!(desktop_unescape("Hello\\sWorld\\\\App"), "Hello World\\App");
+    }
+
+    #[test]
+    fn desktop_scan_ignores_symlinked_directory_cycles() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!(
+            "proton-omarchy-app-scan-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        fs::create_dir_all(root.join("nested")).expect("create test tree");
+        fs::write(
+            root.join("nested/example.desktop"),
+            "[Desktop Entry]\nName=Example\nExec=/usr/bin/sh\n",
+        )
+        .expect("write desktop file");
+        symlink(&root, root.join("nested/cycle")).expect("create cycle");
+
+        let mut files = Vec::new();
+        collect_desktop_files(
+            &root,
+            &mut files,
+            &mut HashSet::new(),
+            &mut HashSet::new(),
+            0,
+        );
+        assert_eq!(files.len(), 1);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn oversized_desktop_files_are_rejected() {
+        let path = std::env::temp_dir().join(format!(
+            "proton-omarchy-oversized-{}.desktop",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let file = fs::File::create(&path).expect("create file");
+        file.set_len(MAX_DESKTOP_FILE_BYTES + 1)
+            .expect("extend file");
+        assert!(parse_desktop_file(&path).is_none());
+        fs::remove_file(path).expect("cleanup");
     }
 }

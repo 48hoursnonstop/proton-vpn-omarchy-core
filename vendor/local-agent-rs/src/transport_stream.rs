@@ -7,6 +7,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex;
 // -----------------------------------------------------------------------------
 
+const MAX_REQUEST_BYTES: usize = 1024 * 1024;
+const MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+
 /// Implements a transport layer using a tokio AsyncReadExt and AsyncWriteExt
 /// trait, this can be a TLS stream or a TCP stream or anything that implements
 /// these traits.
@@ -43,8 +46,9 @@ where
             // Serialize the request to a JSON string.
             let payload = serde_json::to_vec(&request)?;
 
-            // Ensure the payload is not too large.
-            assert!(payload.len() <= u32::MAX as usize);
+            if payload.len() > MAX_REQUEST_BYTES {
+                return Err(Error::RequestTooLarge(payload.len()));
+            }
 
             // Convert the payload length to a big-endian byte array.
             let payload_length: [u8; 4] = (payload.len() as u32).to_be_bytes();
@@ -68,6 +72,10 @@ where
         if let Some(read) = self.read.lock().await.as_mut() {
             // Read the payload length from the server.
             let response_length: usize = read.read_u32().await?.try_into()?;
+
+            if response_length > MAX_RESPONSE_BYTES {
+                return Err(Error::ResponseTooLarge(response_length));
+            }
 
             // Allocate a buffer of that length.
             let mut buf = vec![0u8; response_length];
@@ -105,5 +113,27 @@ where
         self.read.lock().await.take();
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn rejects_oversized_response_before_allocating_it() {
+        let (mut producer, consumer) = tokio::io::duplex(16);
+        let (unused_read, unused_write) = tokio::io::duplex(16);
+        let transport = TransportStream::new(consumer, unused_write);
+        producer
+            .write_all(&((MAX_RESPONSE_BYTES as u32) + 1).to_be_bytes())
+            .await
+            .expect("write response length");
+
+        assert!(matches!(
+            transport.recv().await,
+            Err(Error::ResponseTooLarge(length)) if length == MAX_RESPONSE_BYTES + 1
+        ));
+        drop(unused_read);
     }
 }

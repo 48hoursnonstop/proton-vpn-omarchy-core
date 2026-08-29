@@ -9,8 +9,19 @@ RestartSec=1
 TimeoutStopSec=10
 UMask=0077
 NoNewPrivileges=true
+CapabilityBoundingSet=
+ProtectSystem=strict
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+PrivateTmp=true
 LockPersonality=true
 RestrictSUIDSGID=true
+RestrictRealtime=true
+SystemCallArchitectures=native
 
 [Install]
 WantedBy=default.target

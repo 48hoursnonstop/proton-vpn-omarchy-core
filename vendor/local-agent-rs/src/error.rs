@@ -35,6 +35,10 @@ pub enum Error {
     TokioElapsed(#[from] tokio::time::error::Elapsed),
     #[error("Invalid agent connection: {0}")]
     InvalidAgentConnection(String),
+    #[error("Local Agent request is too large: {0} bytes")]
+    RequestTooLarge(usize),
+    #[error("Local Agent response is too large: {0} bytes")]
+    ResponseTooLarge(usize),
     #[error("Port Forwarding: {0}")]
     PortForwarding(String),
     #[error("Bincode: {0}")]

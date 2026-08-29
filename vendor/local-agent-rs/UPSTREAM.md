@@ -8,7 +8,11 @@ backend does not depend on Python or on an absolute development checkout.
 - Commit: `74ec6f4f093805d766f11f9ef522bf1120591058`
 - Retrieved from the local frozen upstream inventory on 2026-08-26
 
-The source files are unmodified apart from dependency metadata in
-`Cargo.toml`, which reuses this workspace's Tokio/Serde versions and the
-already-selected `x509-parser` release. The GPLv3 license is copied from the
-same Proton VPN Linux source family (`python-proton-vpn-api-core`).
+Local hardening carried by this vendor snapshot:
+
+- length-prefixed requests and responses are bounded before allocation;
+- dependency metadata reuses this workspace's Tokio/Serde versions and the
+  already-selected `x509-parser` release.
+
+The GPLv3 license is copied from the same Proton VPN Linux source family
+(`python-proton-vpn-api-core`).

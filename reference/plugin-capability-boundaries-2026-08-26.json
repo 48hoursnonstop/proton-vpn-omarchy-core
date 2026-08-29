@@ -27,7 +27,7 @@
     "anti_censorship": "Alternative Routing through the official Proton DoH naming scheme and Windows alternative-host TLS pins",
     "connection_observation": "traffic counters, Local Agent NetShield counters, forwarded port and P2P restriction reason 86153",
     "product_data": "profiles, recents, favorites, Default Connection, excluded locations and Connect and Go/private launch",
-    "support": "connection feedback statistical events, report issue, bounded diagnostics, account and upgrade handoff"
+    "support": "opt-in connection feedback statistical events, report issue, bounded diagnostics, account and upgrade handoff; crash upload is not implemented"
   },
   "installed_source_authority": {
     "proton/session/transports/alternativerouting.py": "c063b2a2b675174ef794638743df34f8f05b1da4f4a8397d115652b7b3b85cca",

@@ -76,7 +76,6 @@ const NATIVE_CAPABILITIES: &[&str] = &[
     "feature.netshield",
     "feature.vpn_accelerator",
     "feature.port_forwarding",
-    "feature.anonymous_crash_reports",
     "feature.anonymous_usage_statistics",
     "feature.moderate_nat",
     "feature.ipv6",
@@ -258,5 +257,7 @@ mod tests {
             .contains(&"account.2fa.security_key_cancel"));
         assert!(native.methods().contains(&"report_issue.submit"));
         assert!(native.capabilities().contains(&"feature.kill_switch"));
+        assert!(native.capabilities().contains(&"profiles.custom_dns"));
+        assert!(native.capabilities().contains(&"profiles.lan_policy"));
     }
 }

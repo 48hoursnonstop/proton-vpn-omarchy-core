@@ -297,10 +297,12 @@ pub struct NativeSettings {
     pub allow_lan_connections: bool,
     #[serde(default)]
     pub allow_local_dns: bool,
-    #[serde(default = "default_true")]
+    #[serde(default)]
     pub anonymous_crash_reports: bool,
-    #[serde(default = "default_true")]
+    #[serde(default)]
     pub share_statistics: bool,
+    #[serde(default)]
+    pub privacy_consent_version: u8,
     #[serde(default)]
     pub features: SettingsFeatures,
     #[serde(flatten)]
@@ -326,12 +328,17 @@ impl Default for NativeSettings {
             alternative_routing: true,
             allow_lan_connections: false,
             allow_local_dns: false,
-            anonymous_crash_reports: true,
-            share_statistics: true,
+            anonymous_crash_reports: false,
+            share_statistics: false,
+            privacy_consent_version: current_privacy_consent_version(),
             features: SettingsFeatures::default(),
             extra: serde_json::Map::new(),
         }
     }
+}
+
+fn current_privacy_consent_version() -> u8 {
+    1
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]

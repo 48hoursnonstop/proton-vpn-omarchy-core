@@ -35,6 +35,7 @@ use split_tunnel::SplitTunnelBackend;
 use std::{
     collections::HashSet,
     env, fmt, fs,
+    io::Read,
     net::IpAddr,
     path::{Path, PathBuf},
     sync::{
@@ -44,7 +45,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::{mpsc, watch, Mutex, RwLock};
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 const NATIVE_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "/rust-v2");
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(45);
@@ -698,10 +699,10 @@ impl NativeRuntime {
         self.events.emit("account", data);
     }
 
-    async fn account_login(&self, params: Value) -> NativeResult<Value> {
+    async fn account_login(&self, mut params: Value) -> NativeResult<Value> {
         let _auth = self.auth_write.lock().await;
-        let username = required_param(&params, "username", 320, true)?;
-        let password = required_param(&params, "password", 4096, false)?;
+        let username = take_required_param(&mut params, "username", 320, true)?;
+        let password = Zeroizing::new(take_required_param(&mut params, "password", 4096, false)?);
         if self.state.read().await.session.is_some() {
             return Ok(json!({
                 "success": true,
@@ -724,11 +725,7 @@ impl NativeRuntime {
         );
         self.events
             .stage("account.login", "auth.verifying_credentials", false);
-        let auth = match self
-            .api
-            .authenticate(username.clone(), Zeroizing::new(password))
-            .await
-        {
+        let auth = match self.api.authenticate(username.clone(), password).await {
             Ok(auth) => auth,
             Err(error) if error.code == "sso_required" => {
                 self.events
@@ -819,9 +816,9 @@ impl NativeRuntime {
         }))
     }
 
-    async fn account_submit_2fa(&self, params: Value) -> NativeResult<Value> {
+    async fn account_submit_2fa(&self, mut params: Value) -> NativeResult<Value> {
         let _auth = self.auth_write.lock().await;
-        let code = required_param(&params, "code", 32, true)?;
+        let code = Zeroizing::new(take_required_param(&mut params, "code", 32, true)?);
         let mut auth = self.pending_auth.lock().await.take().ok_or_else(|| {
             NativeError::new(
                 "two_factor_not_required",
@@ -943,8 +940,8 @@ impl NativeRuntime {
         }))
     }
 
-    async fn account_submit_fido2_pin(&self, params: Value) -> NativeResult<Value> {
-        let pin = Zeroizing::new(required_param(&params, "pin", 256, false)?);
+    async fn account_submit_fido2_pin(&self, mut params: Value) -> NativeResult<Value> {
+        let pin = Zeroizing::new(take_required_param(&mut params, "pin", 256, false)?);
         if pin.is_empty() {
             return Err(NativeError::new(
                 "invalid_params",
@@ -1264,7 +1261,7 @@ impl NativeRuntime {
                 "trackers_blocked": local_agent.netshield_trackers.unwrap_or(0),
             },
             "vpn_accelerator": { "enabled": settings.features.vpn_accelerator },
-            "anonymous_crash_reports": { "enabled": settings.anonymous_crash_reports },
+            "anonymous_crash_reports": { "enabled": false },
             "anonymous_usage_statistics": { "enabled": settings.share_statistics },
             "connection_feedback": {
                 "available": feedback_available,
@@ -1294,7 +1291,9 @@ impl NativeRuntime {
                 "kill_switch": true,
                 "netshield": paid,
                 "vpn_accelerator": paid,
-                "anonymous_crash_reports": signed_in,
+                // There is no crash upload implementation yet. Do not expose a
+                // writable switch that would imply otherwise.
+                "anonymous_crash_reports": false,
                 "anonymous_usage_statistics": signed_in,
                 "moderate_nat": paid,
                 "ipv6": signed_in,
@@ -1453,7 +1452,10 @@ impl NativeRuntime {
         let mut settings = previous.clone();
         match feature.as_str() {
             "anonymous_crash_reports" => {
-                settings.anonymous_crash_reports = bool_feature_value(&params, &feature)?;
+                return Err(NativeError::new(
+                    "feature_unavailable",
+                    "Anonymous crash reports are unavailable in this build",
+                ));
             }
             "anonymous_usage_statistics" => {
                 settings.share_statistics = bool_feature_value(&params, &feature)?;
@@ -1544,8 +1546,7 @@ impl NativeRuntime {
         let mut applied_live = false;
         let local_only = matches!(
             feature.as_str(),
-            "anonymous_crash_reports"
-                | "anonymous_usage_statistics"
+            "anonymous_usage_statistics"
                 | "alternative_routing"
                 | "allow_lan_connections"
                 | "allow_local_dns"
@@ -3328,7 +3329,12 @@ fn load_state(paths: &Paths) -> NativeResult<RuntimeState> {
     let session = SecretStore.load_default()?;
     let catalog = Some(ServerCatalog::load(&paths.catalog)?);
     let client_config = load_json::<ClientConfig>(&paths.client_config).ok();
-    let settings = load_json::<NativeSettings>(&paths.settings).unwrap_or_default();
+    let mut settings = load_json::<NativeSettings>(&paths.settings).unwrap_or_default();
+    if migrate_legacy_privacy_defaults(&mut settings) {
+        // Persistence failure is non-fatal: the in-memory values still fail
+        // closed and the migration will be retried on the next start.
+        let _ = settings_store::save(&paths.settings, &settings);
+    }
     Ok(RuntimeState {
         session,
         catalog,
@@ -3342,8 +3348,21 @@ fn load_state(paths: &Paths) -> NativeResult<RuntimeState> {
     })
 }
 
+fn migrate_legacy_privacy_defaults(settings: &mut NativeSettings) -> bool {
+    if settings.privacy_consent_version >= 1 {
+        return false;
+    }
+    // Older builds silently defaulted both switches to true, so a stored true
+    // cannot be distinguished from informed consent. Reset once to opt-in.
+    settings.anonymous_crash_reports = false;
+    settings.share_statistics = false;
+    settings.privacy_consent_version = 1;
+    true
+}
+
 fn load_json<T: serde::de::DeserializeOwned>(path: &Path) -> NativeResult<T> {
-    let raw = fs::read(path).map_err(|error| {
+    const MAX_CACHE_BYTES: u64 = 4 * 1024 * 1024;
+    let metadata = fs::metadata(path).map_err(|error| {
         NativeError::new(
             "cache_unavailable",
             format!("Unable to read Proton cache file {}", path.display()),
@@ -3351,6 +3370,35 @@ fn load_json<T: serde::de::DeserializeOwned>(path: &Path) -> NativeResult<T> {
         .with_source(error)
         .retryable(true)
     })?;
+    if metadata.len() > MAX_CACHE_BYTES {
+        return Err(NativeError::new(
+            "cache_invalid",
+            format!(
+                "Proton cache file exceeds the size limit: {}",
+                path.display()
+            ),
+        ));
+    }
+    let mut raw = Vec::with_capacity(metadata.len() as usize);
+    fs::File::open(path)
+        .and_then(|file| file.take(MAX_CACHE_BYTES + 1).read_to_end(&mut raw))
+        .map_err(|error| {
+            NativeError::new(
+                "cache_unavailable",
+                format!("Unable to read Proton cache file {}", path.display()),
+            )
+            .with_source(error)
+            .retryable(true)
+        })?;
+    if raw.len() > MAX_CACHE_BYTES as usize {
+        return Err(NativeError::new(
+            "cache_invalid",
+            format!(
+                "Proton cache file exceeds the size limit: {}",
+                path.display()
+            ),
+        ));
+    }
     serde_json::from_slice(&raw).map_err(|error| {
         NativeError::new(
             "cache_invalid",
@@ -3707,24 +3755,33 @@ fn with_network_conflicts(error: NativeError, conflicts: &[String]) -> NativeErr
     .retryable(true)
 }
 
-fn required_param(
-    params: &Value,
+fn take_required_param(
+    params: &mut Value,
     name: &str,
     max_bytes: usize,
     trim: bool,
 ) -> NativeResult<String> {
-    let value = params
-        .get(name)
-        .and_then(Value::as_str)
+    let mut value = params
+        .as_object_mut()
+        .and_then(|object| object.remove(name))
+        .and_then(|value| match value {
+            Value::String(value) => Some(value),
+            _ => None,
+        })
         .ok_or_else(|| NativeError::new("invalid_params", format!("{name} is required")))?;
-    let value = if trim { value.trim() } else { value };
+    if trim {
+        let trimmed = value.trim().to_owned();
+        value.zeroize();
+        value = trimmed;
+    }
     if value.is_empty() || value.len() > max_bytes {
+        value.zeroize();
         return Err(NativeError::new(
             "invalid_params",
             format!("{name} must contain between 1 and {max_bytes} bytes"),
         ));
     }
-    Ok(value.to_owned())
+    Ok(value)
 }
 
 fn login_error(mut error: NativeError, stage: &str) -> NativeError {
@@ -3774,6 +3831,21 @@ mod tests {
         assert_eq!(normalized_protocol("wireguard"), "protun-udp");
         assert_eq!(normalized_protocol("wireguard-tcp"), "protun-tcp");
         assert_eq!(normalized_protocol("stealth"), "protun-tls");
+    }
+
+    #[test]
+    fn legacy_telemetry_defaults_are_reset_once_to_opt_in() {
+        let mut settings: NativeSettings = serde_json::from_value(json!({
+            "share_statistics": true,
+            "anonymous_crash_reports": true
+        }))
+        .expect("legacy settings");
+        assert_eq!(settings.privacy_consent_version, 0);
+        assert!(migrate_legacy_privacy_defaults(&mut settings));
+        assert!(!settings.share_statistics);
+        assert!(!settings.anonymous_crash_reports);
+        assert_eq!(settings.privacy_consent_version, 1);
+        assert!(!migrate_legacy_privacy_defaults(&mut settings));
     }
 
     #[test]

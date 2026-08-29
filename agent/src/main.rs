@@ -13,12 +13,22 @@ mod store;
 use config::Config;
 use operations::OperationCoordinator;
 use proton_omarchy_protocol::StateSnapshot;
-use std::io;
+use std::{io, time::Duration};
 use store::StoreHandle;
 use tokio::{signal, sync::watch};
 
-#[tokio::main]
-async fn main() -> io::Result<()> {
+fn main() -> io::Result<()> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    let result = runtime.block_on(run());
+    // Keyring/FIDO work uses Tokio's blocking pool. A wedged device or portal
+    // must not keep systemd waiting until it escalates to SIGKILL.
+    runtime.shutdown_timeout(Duration::from_secs(2));
+    result
+}
+
+async fn run() -> io::Result<()> {
     let config = Config::from_env()?;
     if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--ipc-bridge")) {
         if std::env::args_os().nth(2).is_some() {

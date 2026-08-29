@@ -12,3 +12,6 @@ fingerprint is:
 ```text
 4D01 24DE 0978 8D29 E3A8 798B 12BE 3422 BDA2 422C
 ```
+
+The latest repository security review and its explicit residual limitations
+are recorded in `reference/SECURITY_AUDIT_2026-08-28.md`.
