@@ -18,6 +18,7 @@ use zeroize::Zeroizing;
 
 const API_BASE: &str = "https://vpn-api.proton.me";
 const API_CORE_COMPAT_VERSION: &str = "5.5.11";
+const CREDENTIALLESS_ACCOUNT_NAME: &str = "Proton VPN Guest";
 const MAX_API_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 const TLS_PINS: &[&str] = &[
     "CT56BhOTmj5ZIPgb/xD5mH8rY3BLo/MlhP7oPyJUEDo=",
@@ -76,6 +77,7 @@ pub struct ApiSession {
     pub refresh_token: String,
     pub scopes: Vec<String>,
     pub account_name: String,
+    pub credentialless: bool,
     pub two_factor: Option<Value>,
 }
 
@@ -153,6 +155,7 @@ impl ProtonApi {
             refresh_token: required_string(&unauth_response, "RefreshToken")?,
             scopes: Vec::new(),
             account_name: username.clone(),
+            credentialless: false,
             two_factor: None,
         };
         let info = self
@@ -255,6 +258,23 @@ impl ProtonApi {
             ));
         }
         api_session_from_auth(response, username)
+    }
+
+    /// Starts the same persistent credentialless session used by the official
+    /// Android guest mode. It is a normal authenticated API session with Free
+    /// VPN scope, but it has no Proton account credentials attached to it.
+    pub async fn authenticate_guest(&self) -> NativeResult<ApiSession> {
+        let response = self
+            .request(
+                Method::POST,
+                "/auth/v4/credentialless",
+                Some(json!({ "Payload": {} })),
+                None,
+            )
+            .await?;
+        let mut session = api_session_from_auth(response, CREDENTIALLESS_ACCOUNT_NAME.into())?;
+        session.credentialless = true;
+        Ok(session)
     }
 
     pub async fn submit_2fa(&self, session: &mut ApiSession, code: &str) -> NativeResult<()> {
@@ -799,12 +819,18 @@ fn api_session_from_auth(response: Value, account_name: String) -> NativeResult<
         refresh_token: required_string(&response, "RefreshToken")?,
         scopes: string_array(&response, "Scopes")?,
         account_name,
+        credentialless: false,
         two_factor: response.get("2FA").cloned(),
     })
 }
 
 fn api_error(status: StatusCode, code: i64, payload: &Value) -> NativeError {
     let (native_code, fallback, retryable) = match (status.as_u16(), code) {
+        (_, 10200) => (
+            "credentialless_unavailable",
+            "Proton guest mode is unavailable for this request",
+            false,
+        ),
         (_, 8002) => (
             "authentication_failed",
             "Incorrect Proton credentials or verification code",
@@ -910,5 +936,16 @@ mod tests {
         validate_tls_pin(&response, route.pins()).unwrap();
         let (_, _, payload) = decode_api_response(response, &route).await.unwrap();
         assert!(payload.get("Code").and_then(Value::as_i64).is_some());
+    }
+
+    #[test]
+    fn credentialless_rejection_has_a_stable_client_error() {
+        let error = api_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            10200,
+            &json!({ "Error": "Credentialless session is unavailable" }),
+        );
+        assert_eq!(error.code, "credentialless_unavailable");
+        assert!(!error.retryable);
     }
 }

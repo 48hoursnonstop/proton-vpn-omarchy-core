@@ -53,6 +53,7 @@ const CONNECTION_POLL_INTERVAL: Duration = Duration::from_millis(125);
 const PROTUN_DESCRIPTOR: &str = "/usr/lib/NetworkManager/VPN/nm-protun.name";
 const OPENVPN_DESCRIPTOR: &str = "/usr/lib/NetworkManager/VPN/nm-openvpn-service.name";
 const ACCOUNT_URL: &str = "https://account.protonvpn.com/account";
+const SIGNUP_URL: &str = "https://account.protonvpn.com/signup";
 const AUTO_LOGIN_BASE_URL: &str = "https://account.proton.me/lite";
 const UPGRADE_CHILD_CLIENT_ID: &str = "web-account-lite";
 const LAN_BYPASS_RANGES: &[&str] = &[
@@ -228,6 +229,7 @@ struct NativeRuntime {
     owned_connection_uuid: Mutex<Option<String>>,
     split_available: AtomicBool,
     destination_policy_available: AtomicBool,
+    destination_policy_override: RwLock<Option<(bool, bool)>>,
     split_kill_switch_bypass_active: AtomicBool,
     split_route_write: Mutex<()>,
     connection_attempt: AtomicU64,
@@ -294,6 +296,7 @@ async fn run(mut rx: mpsc::Receiver<BackendRequest>, events: EventSink) {
         owned_connection_uuid: Mutex::new(None),
         split_available: AtomicBool::new(false),
         destination_policy_available: AtomicBool::new(false),
+        destination_policy_override: RwLock::new(None),
         split_kill_switch_bypass_active: AtomicBool::new(false),
         split_route_write: Mutex::new(()),
         connection_attempt: AtomicU64::new(0),
@@ -353,7 +356,13 @@ impl NativeRuntime {
                 if !runtime.destination_policy_available.load(Ordering::Acquire) {
                     continue;
                 }
-                let settings = runtime.state.read().await.settings.clone();
+                let mut settings = runtime.state.read().await.settings.clone();
+                if let Some((allow_lan, allow_local_dns)) =
+                    *runtime.destination_policy_override.read().await
+                {
+                    settings.allow_lan_connections = allow_lan;
+                    settings.allow_local_dns = allow_local_dns;
+                }
                 if settings.allow_lan_connections || settings.allow_local_dns {
                     if let Err(error) = runtime.apply_destination_policy(&settings).await {
                         eprintln!(
@@ -546,6 +555,7 @@ impl NativeRuntime {
             "report_issue.categories.get" => self.report_issue_categories().await,
             "report_issue.submit" => self.report_issue_submit(params).await,
             "account.login" => self.account_login(params).await,
+            "account.login_guest" => self.account_login_guest().await,
             "account.submit_2fa" => self.account_submit_2fa(params).await,
             "account.authenticate_fido2" => self.account_authenticate_fido2().await,
             "account.submit_fido2_pin" => self.account_submit_fido2_pin(params).await,
@@ -603,6 +613,12 @@ impl NativeRuntime {
         }
 
         let stored = self.state.read().await.session.clone();
+        if stored
+            .as_ref()
+            .is_some_and(|session| session.credentialless)
+        {
+            return Ok(json!({ "url": SIGNUP_URL, "authenticated": false }));
+        }
         let selector = match stored {
             Some(stored) => {
                 let session = session_bootstrap::stored_api_session(&stored);
@@ -648,6 +664,7 @@ impl NativeRuntime {
                     "status": "two_factor_required",
                     "name": null,
                     "tier": null,
+                    "credentialless": false,
                     "two_factor_code_supported": true,
                     "two_factor_security_key_supported": security_key_supported,
                     "sso_supported": true,
@@ -662,6 +679,7 @@ impl NativeRuntime {
                 "status": "signed_in",
                 "name": session.account_name,
                 "tier": session.tier(),
+                "credentialless": session.credentialless,
                 "two_factor_code_supported": true,
                 "two_factor_security_key_supported": false,
                 "sso_supported": true,
@@ -670,6 +688,7 @@ impl NativeRuntime {
                 "status": "signed_out",
                 "name": null,
                 "tier": null,
+                "credentialless": false,
                 "two_factor_code_supported": true,
                 "two_factor_security_key_supported": false,
                 "sso_supported": true,
@@ -697,6 +716,7 @@ impl NativeRuntime {
                 "status": "signing_in",
                 "name": null,
                 "tier": null,
+                "credentialless": false,
                 "two_factor_code_supported": false,
                 "two_factor_security_key_supported": false,
                 "sso_supported": true,
@@ -749,6 +769,52 @@ impl NativeRuntime {
         Ok(json!({
             "success": true,
             "authenticated": true,
+            "two_factor_required": false,
+        }))
+    }
+
+    async fn account_login_guest(&self) -> NativeResult<Value> {
+        let _auth = self.auth_write.lock().await;
+        if let Some(session) = self.state.read().await.session.as_ref() {
+            return Ok(json!({
+                "success": true,
+                "authenticated": true,
+                "credentialless": session.credentialless,
+                "two_factor_required": false,
+            }));
+        }
+
+        self.events.emit(
+            "account",
+            json!({
+                "status": "signing_in",
+                "name": null,
+                "tier": null,
+                "credentialless": true,
+                "two_factor_code_supported": false,
+                "two_factor_security_key_supported": false,
+                "sso_supported": false,
+            }),
+        );
+        self.events
+            .stage("account.login_guest", "auth.creating_guest_session", false);
+        let auth = match self.api.authenticate_guest().await {
+            Ok(auth) => auth,
+            Err(error) => {
+                self.emit_account().await;
+                return Err(error);
+            }
+        };
+        self.events
+            .stage("account.login_guest", "auth.finalizing", false);
+        if let Err(error) = self.finalize_auth(auth, "account.login_guest").await {
+            self.emit_account().await;
+            return Err(error);
+        }
+        Ok(json!({
+            "success": true,
+            "authenticated": true,
+            "credentialless": true,
             "two_factor_required": false,
         }))
     }
@@ -1322,6 +1388,33 @@ impl NativeRuntime {
         .map_err(join_error)?
     }
 
+    async fn apply_connection_destination_policy(
+        &self,
+        global: &NativeSettings,
+        effective: &NativeSettings,
+    ) -> NativeResult<()> {
+        let differs = global.allow_lan_connections != effective.allow_lan_connections
+            || global.allow_local_dns != effective.allow_local_dns;
+        if !differs {
+            *self.destination_policy_override.write().await = None;
+            return Ok(());
+        }
+        self.apply_destination_policy(effective).await?;
+        *self.destination_policy_override.write().await =
+            Some((effective.allow_lan_connections, effective.allow_local_dns));
+        Ok(())
+    }
+
+    async fn restore_global_destination_policy(&self) -> NativeResult<()> {
+        if self.destination_policy_override.read().await.is_none() {
+            return Ok(());
+        }
+        let global = self.state.read().await.settings.clone();
+        self.apply_destination_policy(&global).await?;
+        *self.destination_policy_override.write().await = None;
+        Ok(())
+    }
+
     async fn feature_set(&self, params: Value) -> NativeResult<Value> {
         let feature = params
             .get("feature")
@@ -1571,7 +1664,8 @@ impl NativeRuntime {
         if matches!(
             feature.as_str(),
             "allow_lan_connections" | "allow_local_dns"
-        ) {
+        ) && self.destination_policy_override.read().await.is_none()
+        {
             self.apply_destination_policy(&settings).await?;
             applied_live = true;
         }
@@ -1599,7 +1693,8 @@ impl NativeRuntime {
             } else if matches!(
                 feature.as_str(),
                 "allow_lan_connections" | "allow_local_dns"
-            ) {
+            ) && applied_live
+            {
                 let _ = self.apply_destination_policy(&previous).await;
             } else if applied_live {
                 if let (Some(target), Some(agent)) = (
@@ -1977,20 +2072,22 @@ impl NativeRuntime {
         self.events
             .stage("connection.connect", "tunnel.selecting_server", true);
 
-        let (target, client_config, settings, protocol, profile_settings_applied) = {
+        let (target, client_config, global_settings, settings, protocol, profile_settings_applied) = {
             let state = self.state.read().await;
             let catalog = state.catalog.as_ref().ok_or_else(catalog_unavailable)?;
             let client_config = state
                 .client_config
                 .clone()
                 .ok_or_else(client_config_unavailable)?;
+            let global_settings = state.settings.clone();
             let (settings, protocol, profile_settings_applied) =
-                effective_connection_settings(&params, &state.settings, tier)?;
+                effective_connection_settings(&params, &global_settings, tier)?;
             let excluded_locations = self.events.store.excluded_locations();
             let target = catalog.select(&params, tier, &excluded_locations)?;
             (
                 target,
                 client_config,
+                global_settings,
                 settings,
                 protocol,
                 profile_settings_applied,
@@ -2006,6 +2103,8 @@ impl NativeRuntime {
         })
         .await
         .map_err(join_error)?;
+        self.apply_connection_destination_policy(&global_settings, &settings)
+            .await?;
         let attempt = self.connection_attempt.fetch_add(1, Ordering::SeqCst) + 1;
         self.events
             .stage("connection.connect", "tunnel.connecting", true);
@@ -2048,11 +2147,18 @@ impl NativeRuntime {
                 }
             }
         })
-        .await
-        .map_err(join_error)?;
+        .await;
         let activation = match activation {
             Ok(activation) => activation,
             Err(error) => {
+                self.restore_global_destination_policy().await?;
+                return Err(join_error(error));
+            }
+        };
+        let activation = match activation {
+            Ok(activation) => activation,
+            Err(error) => {
+                self.restore_global_destination_policy().await?;
                 let error = with_network_conflicts(error, &network_conflicts);
                 self.events.emit(
                     "connection",
@@ -2245,6 +2351,10 @@ impl NativeRuntime {
         // this fails, keep the tunnel up so protected traffic cannot leak.
         self.reconcile_split_kill_switch_bypass(&settings, false)
             .await?;
+        // Restore global LAN/DNS routing while the tunnel is still protecting
+        // traffic. If this fails, keep the tunnel up instead of leaking a
+        // profile-specific bypass into the disconnected state.
+        self.restore_global_destination_policy().await?;
         self.stop_local_agent().await;
         let kill_switch_mode = settings.killswitch;
         let ipv6_leak_protection = settings.ipv6_leak_protection;
@@ -3032,6 +3142,9 @@ fn effective_connection_settings(
         .unwrap_or(2) as u8;
     let moderate_nat = optional_profile_bool(raw, "moderate_nat", false)?;
     let port_forwarding = optional_profile_bool(raw, "port_forwarding", false)?;
+    let custom_dns = profile_custom_dns(raw.get("custom_dns"))?;
+    let allow_lan_connections = optional_profile_policy(raw, "allow_lan_connections")?;
+    let allow_local_dns = optional_profile_policy(raw, "allow_local_dns")?;
     if tier == 0 && (netshield_enabled || moderate_nat || port_forwarding) {
         return Err(NativeError::new(
             "feature_unavailable",
@@ -3044,6 +3157,12 @@ fn effective_connection_settings(
             "Moderate NAT and port forwarding cannot be enabled together",
         ));
     }
+    if netshield_enabled && custom_dns.as_ref().is_some_and(|dns| dns.enabled) {
+        return Err(NativeError::new(
+            "profile_settings_conflict",
+            "Custom DNS and NetShield cannot be enabled in the same profile",
+        ));
+    }
 
     let mut settings = global.clone();
     settings.protocol = protocol.clone();
@@ -3054,10 +3173,113 @@ fn effective_connection_settings(
     };
     settings.features.moderate_nat = moderate_nat;
     settings.features.port_forwarding = port_forwarding;
-    if netshield_enabled {
+    if let Some(custom_dns) = custom_dns {
+        settings.custom_dns = custom_dns;
+    } else if netshield_enabled {
+        // Preserve the existing profile precedence: an explicit profile
+        // NetShield choice wins over inherited global DNS. Explicit custom
+        // DNS is rejected above instead of being silently discarded.
         settings.custom_dns.enabled = false;
     }
+    if let Some(allow) = allow_lan_connections {
+        settings.allow_lan_connections = allow;
+    }
+    if let Some(allow) = allow_local_dns {
+        settings.allow_local_dns = allow;
+    }
     Ok((settings, protocol, true))
+}
+
+fn profile_custom_dns(value: Option<&Value>) -> NativeResult<Option<models::CustomDns>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let object = value.as_object().ok_or_else(|| {
+        NativeError::new("invalid_params", "profile custom_dns must be an object")
+    })?;
+    let mode = object
+        .get("mode")
+        .and_then(Value::as_str)
+        .unwrap_or("inherit")
+        .trim()
+        .to_ascii_lowercase();
+    if mode == "inherit" {
+        return Ok(None);
+    }
+    if mode == "off" {
+        return Ok(Some(models::CustomDns::default()));
+    }
+    if mode != "custom" {
+        return Err(NativeError::new(
+            "invalid_params",
+            "profile custom DNS mode must be inherit, off or custom",
+        ));
+    }
+    let servers = object
+        .get("servers")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            NativeError::new(
+                "invalid_dns",
+                "A custom DNS profile requires an array of DNS server IPs",
+            )
+        })?;
+    if servers.len() > 16 {
+        return Err(NativeError::new(
+            "invalid_dns",
+            "A profile can contain at most 16 custom DNS servers",
+        ));
+    }
+    let mut seen = HashSet::new();
+    let mut normalized = Vec::new();
+    for value in servers {
+        let value = value.as_str().ok_or_else(|| {
+            NativeError::new("invalid_dns", "Profile DNS servers must be strings")
+        })?;
+        if value.trim().is_empty() {
+            continue;
+        }
+        let address = value.trim().parse::<IpAddr>().map_err(|error| {
+            NativeError::new("invalid_dns", "Invalid profile DNS IP").with_source(error)
+        })?;
+        let address = address.to_string();
+        if seen.insert(address.clone()) {
+            normalized.push(json!({ "ip": address, "enabled": true }));
+        }
+    }
+    if normalized.is_empty() {
+        return Err(NativeError::new(
+            "invalid_dns",
+            "A custom DNS profile requires at least one DNS server",
+        ));
+    }
+    Ok(Some(models::CustomDns {
+        enabled: true,
+        ip_list: normalized,
+        extra: serde_json::Map::new(),
+    }))
+}
+
+fn optional_profile_policy(
+    object: &serde_json::Map<String, Value>,
+    key: &str,
+) -> NativeResult<Option<bool>> {
+    object
+        .get(key)
+        .map(|value| {
+            if value.is_null() {
+                Ok(None)
+            } else {
+                value.as_bool().map(Some).ok_or_else(|| {
+                    NativeError::new(
+                        "invalid_params",
+                        format!("profile {key} must be boolean or null"),
+                    )
+                })
+            }
+        })
+        .transpose()
+        .map(Option::flatten)
 }
 
 fn optional_profile_bool(
@@ -3642,5 +3864,42 @@ mod tests {
         assert_eq!(transport.code, "api_response_invalid");
         assert!(transport.retryable);
         assert_eq!(transport.details.unwrap()["auth_stage"], "credentials");
+    }
+
+    #[test]
+    fn profile_custom_dns_and_destination_policies_are_strictly_parsed() {
+        let dns = profile_custom_dns(Some(&json!({
+            "mode": "custom",
+            "servers": ["1.1.1.1", "1.1.1.1", "2001:0db8::1"]
+        })))
+        .expect("valid profile DNS")
+        .expect("explicit profile DNS");
+        assert!(dns.enabled);
+        assert_eq!(dns.ip_list.len(), 2);
+        assert_eq!(dns.ip_list[1]["ip"], "2001:db8::1");
+
+        assert!(profile_custom_dns(Some(&json!({ "mode": "inherit" })))
+            .unwrap()
+            .is_none());
+        assert!(
+            !profile_custom_dns(Some(&json!({ "mode": "off" })))
+                .unwrap()
+                .unwrap()
+                .enabled
+        );
+
+        let policies = json!({
+            "allow_lan_connections": true,
+            "allow_local_dns": null
+        });
+        let policies = policies.as_object().unwrap();
+        assert_eq!(
+            optional_profile_policy(policies, "allow_lan_connections").unwrap(),
+            Some(true)
+        );
+        assert_eq!(
+            optional_profile_policy(policies, "allow_local_dns").unwrap(),
+            None
+        );
     }
 }

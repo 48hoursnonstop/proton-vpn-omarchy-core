@@ -98,6 +98,7 @@ pub async fn fetch(
         refresh_token: auth.refresh_token,
         scopes: auth.scopes,
         account_name: auth.account_name,
+        credentialless: auth.credentialless,
         environment: "prod".into(),
         vpn: VpnSessionData {
             vpninfo: without_api_code(vpn_info),
@@ -133,6 +134,7 @@ pub fn stored_api_session(session: &SessionData) -> ApiSession {
         refresh_token: session.refresh_token.clone(),
         scopes: session.scopes.clone(),
         account_name: session.account_name.clone(),
+        credentialless: session.credentialless,
         two_factor: session
             .extra
             .get("LastUseData")

@@ -576,6 +576,7 @@ mod tests {
             refresh_token: "refresh".into(),
             scopes: vec!["twofactor".into()],
             account_name: "test".into(),
+            credentialless: false,
             two_factor: Some(json!({
                 "FIDO2": { "AuthenticationOptions": options }
             })),

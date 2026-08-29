@@ -6,9 +6,10 @@ use proton_omarchy_protocol::{CanonicalStoreState, StateSnapshot};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashSet},
     fs::{self, OpenOptions},
     io::{self, Write},
+    net::IpAddr,
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     sync::{Arc, Mutex, MutexGuard},
@@ -928,7 +929,13 @@ fn resolved_profile(profile: &Value, selection_type: &str) -> BackendResult {
                 "netshield_enabled": object.get("profileNetShieldEnabled").and_then(Value::as_bool).unwrap_or(true),
                 "netshield_level": object.get("profileNetShieldLevel").and_then(Value::as_u64).unwrap_or(2),
                 "moderate_nat": object.get("profileNatType").and_then(Value::as_str) == Some("moderate"),
-                "port_forwarding": object.get("profilePortForwardingEnabled").and_then(Value::as_bool).unwrap_or(false)
+                "port_forwarding": object.get("profilePortForwardingEnabled").and_then(Value::as_bool).unwrap_or(false),
+                "custom_dns": {
+                    "mode": object.get("profileCustomDnsMode").and_then(Value::as_str).unwrap_or("inherit"),
+                    "servers": object.get("profileCustomDnsServers").and_then(Value::as_array).cloned().unwrap_or_default()
+                },
+                "allow_lan_connections": profile_policy_value(object, "profileLanMode"),
+                "allow_local_dns": profile_policy_value(object, "profileLocalDnsMode")
             }
         },
         "recent": {
@@ -1042,6 +1049,49 @@ fn normalize_profile(
         "profilePortForwardingEnabled".into(),
         Value::Bool(port_forwarding),
     );
+    let custom_dns_mode = profile_mode(raw, "profileCustomDnsMode", &["inherit", "off", "custom"])?;
+    let custom_dns_servers = profile_dns_servers(raw.get("profileCustomDnsServers"))?;
+    if custom_dns_mode == "custom" && custom_dns_servers.is_empty() {
+        return Err(BackendError::new(
+            "invalid_dns",
+            "A custom DNS profile requires at least one DNS server",
+        ));
+    }
+    if custom_dns_mode == "custom"
+        && profile
+            .get("profileNetShieldEnabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(true)
+    {
+        return Err(BackendError::new(
+            "profile_settings_conflict",
+            "Custom DNS and NetShield cannot be enabled in the same profile",
+        ));
+    }
+    profile.insert(
+        "profileCustomDnsMode".into(),
+        Value::String(custom_dns_mode),
+    );
+    profile.insert(
+        "profileCustomDnsServers".into(),
+        Value::Array(custom_dns_servers.into_iter().map(Value::String).collect()),
+    );
+    profile.insert(
+        "profileLanMode".into(),
+        Value::String(profile_mode(
+            raw,
+            "profileLanMode",
+            &["inherit", "allow", "block"],
+        )?),
+    );
+    profile.insert(
+        "profileLocalDnsMode".into(),
+        Value::String(profile_mode(
+            raw,
+            "profileLocalDnsMode",
+            &["inherit", "allow", "block"],
+        )?),
+    );
     let connect_and_go_enabled = optional_bool(raw, "connectAndGoEnabled", false)?;
     let connect_and_go_mode =
         string_or(raw, "connectAndGoMode", "website", 32)?.to_ascii_lowercase();
@@ -1095,6 +1145,69 @@ fn normalize_profile(
     profile.insert("createdAtMs".into(), json!(created));
     profile.insert("updatedAtMs".into(), json!(now));
     Ok(profile)
+}
+
+fn profile_mode(
+    raw: &Map<String, Value>,
+    key: &str,
+    allowed: &[&str],
+) -> Result<String, BackendError> {
+    let value = string_or(raw, key, "inherit", 16)?.to_ascii_lowercase();
+    if allowed.contains(&value.as_str()) {
+        Ok(value)
+    } else {
+        Err(BackendError::new(
+            "invalid_params",
+            format!("{key} contains an unsupported policy"),
+        ))
+    }
+}
+
+fn profile_dns_servers(value: Option<&Value>) -> Result<Vec<String>, BackendError> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    let values = value.as_array().ok_or_else(|| {
+        BackendError::new(
+            "invalid_dns",
+            "profileCustomDnsServers must be an array of IP addresses",
+        )
+    })?;
+    if values.len() > 16 {
+        return Err(BackendError::new(
+            "invalid_dns",
+            "A profile can contain at most 16 custom DNS servers",
+        ));
+    }
+    let mut servers = Vec::new();
+    let mut seen = HashSet::new();
+    for value in values {
+        let value = value.as_str().ok_or_else(|| {
+            BackendError::new("invalid_dns", "Profile DNS servers must be strings")
+        })?;
+        if value.trim().is_empty() {
+            continue;
+        }
+        let address = value.trim().parse::<IpAddr>().map_err(|_| {
+            BackendError::new(
+                "invalid_dns",
+                "Profile DNS servers must be valid IP addresses",
+            )
+        })?;
+        let normalized = address.to_string();
+        if seen.insert(normalized.clone()) {
+            servers.push(normalized);
+        }
+    }
+    Ok(servers)
+}
+
+fn profile_policy_value(object: &Map<String, Value>, key: &str) -> Value {
+    match object.get(key).and_then(Value::as_str).unwrap_or("inherit") {
+        "allow" => Value::Bool(true),
+        "block" => Value::Bool(false),
+        _ => Value::Null,
+    }
 }
 
 fn insert_profile_string(
@@ -1947,6 +2060,104 @@ mod tests {
             Some(&json!("Streaming copy 2"))
         );
         assert_eq!(account_ref(&data).profiles.len(), 3);
+    }
+
+    #[test]
+    fn older_profiles_inherit_new_dns_and_lan_policies() {
+        let profile = normalize_profile(
+            json!({
+                "name": "Existing profile",
+                "targetKind": "fastest",
+                "profileNetShieldEnabled": false
+            })
+            .as_object()
+            .unwrap(),
+            None,
+            "profile-existing",
+        )
+        .expect("normalize older profile");
+        assert_eq!(profile["profileCustomDnsMode"], "inherit");
+        assert_eq!(profile["profileCustomDnsServers"], json!([]));
+        assert_eq!(profile["profileLanMode"], "inherit");
+        assert_eq!(profile["profileLocalDnsMode"], "inherit");
+
+        let resolved = resolved_profile(&Value::Object(profile), "profile")
+            .expect("resolve inherited policies");
+        assert!(resolved["connect_params"]["profile_settings"]["allow_lan_connections"].is_null());
+        assert!(resolved["connect_params"]["profile_settings"]["allow_local_dns"].is_null());
+        assert_eq!(
+            resolved["connect_params"]["profile_settings"]["custom_dns"]["mode"],
+            "inherit"
+        );
+    }
+
+    #[test]
+    fn profile_dns_is_validated_normalized_and_deduplicated() {
+        let profile = normalize_profile(
+            json!({
+                "name": "Private resolver",
+                "targetKind": "fastest",
+                "profileNetShieldEnabled": false,
+                "profileCustomDnsMode": "custom",
+                "profileCustomDnsServers": [" 1.1.1.1 ", "1.1.1.1", "2001:0db8::1"],
+                "profileLanMode": "allow",
+                "profileLocalDnsMode": "block"
+            })
+            .as_object()
+            .unwrap(),
+            None,
+            "profile-dns",
+        )
+        .expect("normalize profile DNS");
+        assert_eq!(
+            profile["profileCustomDnsServers"],
+            json!(["1.1.1.1", "2001:db8::1"])
+        );
+        let resolved =
+            resolved_profile(&Value::Object(profile), "profile").expect("resolve profile DNS");
+        assert_eq!(
+            resolved["connect_params"]["profile_settings"]["allow_lan_connections"],
+            true
+        );
+        assert_eq!(
+            resolved["connect_params"]["profile_settings"]["allow_local_dns"],
+            false
+        );
+    }
+
+    #[test]
+    fn profile_rejects_invalid_dns_and_netshield_conflict() {
+        let invalid = normalize_profile(
+            json!({
+                "name": "Invalid DNS",
+                "targetKind": "fastest",
+                "profileNetShieldEnabled": false,
+                "profileCustomDnsMode": "custom",
+                "profileCustomDnsServers": ["not-an-ip"]
+            })
+            .as_object()
+            .unwrap(),
+            None,
+            "profile-invalid-dns",
+        )
+        .expect_err("invalid DNS must fail");
+        assert_eq!(invalid.code, "invalid_dns");
+
+        let conflict = normalize_profile(
+            json!({
+                "name": "DNS and NetShield",
+                "targetKind": "fastest",
+                "profileNetShieldEnabled": true,
+                "profileCustomDnsMode": "custom",
+                "profileCustomDnsServers": ["9.9.9.9"]
+            })
+            .as_object()
+            .unwrap(),
+            None,
+            "profile-conflict",
+        )
+        .expect_err("NetShield conflict must fail");
+        assert_eq!(conflict.code, "profile_settings_conflict");
     }
 
     #[test]

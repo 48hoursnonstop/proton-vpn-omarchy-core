@@ -28,6 +28,8 @@ pub struct SessionData {
     #[serde(default)]
     pub scopes: Vec<String>,
     pub account_name: String,
+    #[serde(default)]
+    pub credentialless: bool,
     #[serde(default = "default_environment")]
     pub environment: String,
     #[serde(rename = "vpn")]

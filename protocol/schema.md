@@ -70,6 +70,19 @@ conflict while the shared session itself is changing.
 
 ## Authentication and security keys
 
+Credentialless guest login uses the same public contract as Proton's Android client:
+
+```json
+{"v":1,"id":"19","type":"request","method":"account.login_guest","params":{}}
+```
+
+The agent calls Proton's `/auth/v4/credentialless` endpoint, then runs the normal VPN bootstrap,
+certificate and server-catalog flow. The resulting Free-tier session is stored in Secret Service
+and survives agent and system restarts. `account.credentialless=true` distinguishes it from a
+regular account without exposing its internal storage identity. Guest mode does not relax Free
+plan restrictions. Account web hand-off opens the Proton signup page instead of attempting a
+session fork.
+
 Credential login and authenticator-code 2FA use the official `ProtonVPNAPI.login()` and
 `submit_2fa_code()` paths. `account.two_factor_code_supported` and
 `account.two_factor_security_key_supported` describe the methods available while
@@ -414,17 +427,27 @@ A profile connection may attach a client-persisted `profile_settings` object to 
       "netshield_enabled":true,
       "netshield_level":2,
       "moderate_nat":false,
-      "port_forwarding":false
+      "port_forwarding":false,
+      "custom_dns":{"mode":"custom","servers":["1.1.1.1","2606:4700:4700::1111"]},
+      "allow_lan_connections":true,
+      "allow_local_dns":false
     }
   }
 }
 ```
 
-These values are **per-connection overrides**. The bridge deep-copies the persisted Proton Linux
-settings, applies the profile values to that copy, and supplies the copy to the frozen
-`VPNConnector.connect()` settings-read path. It never calls `save_settings()` for these values.
-If NetShield is enabled, custom DNS is disabled only in the ephemeral profile snapshot, matching
-the Windows profile settings contract.
+These values are **per-connection overrides**. The Rust agent clones global settings, validates
+the profile and builds an ephemeral NetworkManager profile; it never persists the overrides as
+global settings. Older profiles resolve `custom_dns.mode`, LAN and local-DNS policy to `inherit`.
+Custom DNS modes are `inherit`, `off` and `custom`; a custom list contains at most 16 canonical
+IPv4/IPv6 addresses. Explicit custom DNS and NetShield are rejected together. When DNS is
+inherited, an explicit profile NetShield choice keeps its existing precedence over global custom
+DNS.
+
+`allow_lan_connections` and `allow_local_dns` are booleans or `null` (`null` means inherit). Their
+destination routing is installed before tunnel activation and the global policy is restored while
+the tunnel is still up during disconnect. A failed restoration leaves the tunnel up rather than
+carrying profile-only bypass routes into a disconnected state.
 
 Windows `VpnProtocol` mapping used by this port:
 

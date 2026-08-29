@@ -88,6 +88,10 @@ pub(crate) fn apply_event(
                     .get("tier")
                     .and_then(Value::as_u64)
                     .and_then(|tier| u8::try_from(tier).ok());
+                state.account.credentialless = data
+                    .get("credentialless")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
                 state.account.two_factor_code_supported = data
                     .get("two_factor_code_supported")
                     .and_then(Value::as_bool)

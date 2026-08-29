@@ -19,6 +19,7 @@ pub const BACKEND_METHODS: &[&str] = &[
     "report_issue.submit",
     "diagnostics.get",
     "account.login",
+    "account.login_guest",
     "account.submit_2fa",
     "account.authenticate_fido2",
     "account.submit_fido2_pin",
@@ -169,6 +170,20 @@ pub struct ProfileConnectionSettings {
     pub moderate_nat: bool,
     #[serde(default)]
     pub port_forwarding: bool,
+    #[serde(default)]
+    pub custom_dns: ProfileCustomDns,
+    #[serde(default)]
+    pub allow_lan_connections: Option<bool>,
+    #[serde(default)]
+    pub allow_local_dns: Option<bool>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ProfileCustomDns {
+    #[serde(default)]
+    pub mode: String,
+    #[serde(default)]
+    pub servers: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -391,6 +406,8 @@ pub struct AccountState {
     pub name: Option<String>,
     pub tier: Option<u8>,
     #[serde(default)]
+    pub credentialless: bool,
+    #[serde(default)]
     pub two_factor_code_supported: bool,
     #[serde(default)]
     pub two_factor_security_key_supported: bool,
@@ -405,6 +422,7 @@ impl Default for AccountState {
             status: AccountStatus::Unknown,
             name: None,
             tier: None,
+            credentialless: false,
             two_factor_code_supported: false,
             two_factor_security_key_supported: false,
             sso_supported: false,
