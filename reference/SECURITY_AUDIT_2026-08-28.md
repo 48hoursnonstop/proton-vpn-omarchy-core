@@ -23,6 +23,10 @@ installer, release workflow, and the independently distributed QML frontend.
 - Restricted SSO callbacks to the exact HTTPS Proton API origin.
 - Bounded Chromium control frames, DNS-over-HTTPS replies, cached JSON,
   desktop-entry files, and Proton Local Agent frames before allocation.
+- Kept the production server catalog bounded at 64 MiB while retaining the
+  tighter 4 MiB API limit for authentication and support responses. Cache
+  failures are isolated so replaceable catalog data cannot discard a valid
+  keyring session or reset privacy/network settings.
 - Prevented desktop-entry scans from following directory symlink cycles and
   capped scan depth/count/query size.
 - Corrected split-tunneling executable matching so `/usr/bin/fire` does not

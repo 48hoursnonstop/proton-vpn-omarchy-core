@@ -3,7 +3,7 @@ use super::{
         country_name, LogicalServer, PhysicalServer, ServerCatalog, FEATURE_P2P,
         FEATURE_SECURE_CORE, FEATURE_TOR,
     },
-    NativeError, NativeResult,
+    NativeError, NativeResult, MAX_SERVER_CATALOG_BYTES,
 };
 use crate::store::ExcludedLocation;
 use rand::prelude::IndexedRandom;
@@ -24,7 +24,7 @@ pub struct ConnectionTarget {
 
 impl ServerCatalog {
     pub fn load(path: &Path) -> NativeResult<Self> {
-        const MAX_CATALOG_BYTES: u64 = 8 * 1024 * 1024;
+        let max_catalog_bytes = MAX_SERVER_CATALOG_BYTES as u64;
         let metadata = fs::metadata(path).map_err(|error| {
             NativeError::new(
                 "catalog_unavailable",
@@ -36,7 +36,7 @@ impl ServerCatalog {
             .with_source(error)
             .retryable(true)
         })?;
-        if metadata.len() > MAX_CATALOG_BYTES {
+        if metadata.len() > max_catalog_bytes {
             return Err(NativeError::new(
                 "catalog_invalid",
                 "The Proton server catalog exceeds the size limit",
@@ -44,7 +44,7 @@ impl ServerCatalog {
         }
         let mut raw = Vec::with_capacity(metadata.len() as usize);
         fs::File::open(path)
-            .and_then(|file| file.take(MAX_CATALOG_BYTES + 1).read_to_end(&mut raw))
+            .and_then(|file| file.take(max_catalog_bytes + 1).read_to_end(&mut raw))
             .map_err(|error| {
                 NativeError::new(
                     "catalog_unavailable",
@@ -56,7 +56,7 @@ impl ServerCatalog {
                 .with_source(error)
                 .retryable(true)
             })?;
-        if raw.len() > MAX_CATALOG_BYTES as usize {
+        if raw.len() > MAX_SERVER_CATALOG_BYTES {
             return Err(NativeError::new(
                 "catalog_invalid",
                 "The Proton server catalog exceeds the size limit",

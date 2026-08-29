@@ -51,6 +51,10 @@ const NATIVE_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "/rust-v2");
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(45);
 const LOCAL_AGENT_READY_TIMEOUT: Duration = Duration::from_secs(20);
 const CONNECTION_POLL_INTERVAL: Duration = Duration::from_millis(125);
+// Proton's production /vpn/v2 response is currently around 24 MiB and grows
+// with the server fleet. Keep a bounded amount of headroom without applying
+// this much larger allowance to authentication or support responses.
+const MAX_SERVER_CATALOG_BYTES: usize = 64 * 1024 * 1024;
 const PROTUN_DESCRIPTOR: &str = "/usr/lib/NetworkManager/VPN/nm-protun.name";
 const OPENVPN_DESCRIPTOR: &str = "/usr/lib/NetworkManager/VPN/nm-openvpn-service.name";
 const ACCOUNT_URL: &str = "https://account.protonvpn.com/account";
@@ -3327,7 +3331,14 @@ fn unix_seconds() -> NativeResult<u64> {
 
 fn load_state(paths: &Paths) -> NativeResult<RuntimeState> {
     let session = SecretStore.load_default()?;
-    let catalog = Some(ServerCatalog::load(&paths.catalog)?);
+    Ok(load_cached_state(paths, session))
+}
+
+fn load_cached_state(paths: &Paths, session: Option<SessionData>) -> RuntimeState {
+    // Catalog and client-config caches are replaceable API data. A stale,
+    // missing or corrupt cache must not discard a valid keyring session or
+    // reset user settings; dependent requests report their own precise error.
+    let catalog = ServerCatalog::load(&paths.catalog).ok();
     let client_config = load_json::<ClientConfig>(&paths.client_config).ok();
     let mut settings = load_json::<NativeSettings>(&paths.settings).unwrap_or_default();
     if migrate_legacy_privacy_defaults(&mut settings) {
@@ -3335,7 +3346,7 @@ fn load_state(paths: &Paths) -> NativeResult<RuntimeState> {
         // closed and the migration will be retried on the next start.
         let _ = settings_store::save(&paths.settings, &settings);
     }
-    Ok(RuntimeState {
+    RuntimeState {
         session,
         catalog,
         client_config,
@@ -3345,7 +3356,7 @@ fn load_state(paths: &Paths) -> NativeResult<RuntimeState> {
         connection_feedback_feature_enabled: false,
         feedback_session: None,
         pending_connection_trigger: "connection_card".into(),
-    })
+    }
 }
 
 fn migrate_legacy_privacy_defaults(settings: &mut NativeSettings) -> bool {
@@ -3846,6 +3857,54 @@ mod tests {
         assert!(!settings.anonymous_crash_reports);
         assert_eq!(settings.privacy_consent_version, 1);
         assert!(!migrate_legacy_privacy_defaults(&mut settings));
+    }
+
+    #[test]
+    fn replaceable_cache_failure_preserves_an_authenticated_session() {
+        let root = env::temp_dir().join(format!(
+            "proton-omarchy-cache-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&root).expect("temporary cache directory");
+        let paths = Paths {
+            catalog: root.join("missing-serverlist.json"),
+            client_config: root.join("missing-clientconfig.json"),
+            settings: root.join("missing-settings.json"),
+            statistics: root.join("statistics.json"),
+        };
+        let session = SessionData {
+            uid: "uid".into(),
+            access_token: "access".into(),
+            refresh_token: "refresh".into(),
+            scopes: vec!["vpn".into()],
+            account_name: "account".into(),
+            credentialless: false,
+            environment: "prod".into(),
+            vpn: models::VpnSessionData {
+                vpninfo: json!({"VPN": {"MaxTier": 1}}),
+                certificate: models::VpnCertificate {
+                    certificate: "certificate".into(),
+                    client_key: "client-key".into(),
+                    client_key_fingerprint: String::new(),
+                    expiration_time: 1,
+                    refresh_time: 1,
+                    server_public_key: String::new(),
+                    server_public_key_mode: String::new(),
+                    extra: Default::default(),
+                },
+                secrets: models::VpnSecrets {
+                    ed25519_privatekey: "private-key".into(),
+                },
+                location: models::VpnLocation::default(),
+            },
+            extra: Default::default(),
+        };
+
+        let state = load_cached_state(&paths, Some(session));
+        assert!(state.session.is_some());
+        assert!(state.catalog.is_none());
+        assert!(state.client_config.is_none());
+        fs::remove_dir_all(root).expect("remove temporary cache directory");
     }
 
     #[test]

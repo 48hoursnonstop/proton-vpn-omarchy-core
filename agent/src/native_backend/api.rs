@@ -1,6 +1,6 @@
 use super::alternative_routing::{self, AlternativeRoute};
 use super::fido2::FidoAssertion;
-use super::{web_auth, EventSink, NativeError, NativeResult};
+use super::{web_auth, EventSink, NativeError, NativeResult, MAX_SERVER_CATALOG_BYTES};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use proton_srp::{SRPAuth, SRPProofB64, SrpHashVersion};
 use reqwest::{cookie::Jar, header, Method, StatusCode};
@@ -671,6 +671,7 @@ async fn decode_api_response(
     mut response: reqwest::Response,
     route: &ApiRoute,
 ) -> NativeResult<(StatusCode, Option<u64>, Value)> {
+    let response_limit = response_body_limit(response.url().path());
     let status = response.status();
     let retry_after = response
         .headers()
@@ -688,13 +689,13 @@ async fn decode_api_response(
         .collect::<String>();
     if response
         .content_length()
-        .is_some_and(|length| length > MAX_API_RESPONSE_BYTES as u64)
+        .is_some_and(|length| length > response_limit as u64)
     {
         return Err(invalid_response_error(
             status,
             route,
             &content_type,
-            MAX_API_RESPONSE_BYTES + 1,
+            response_limit + 1,
             "response exceeds the size limit",
         ));
     }
@@ -714,7 +715,7 @@ async fn decode_api_response(
         let Some(chunk) = chunk else {
             break;
         };
-        if body.len().saturating_add(chunk.len()) > MAX_API_RESPONSE_BYTES {
+        if body.len().saturating_add(chunk.len()) > response_limit {
             return Err(invalid_response_error(
                 status,
                 route,
@@ -737,6 +738,14 @@ async fn decode_api_response(
         .with_source(error)
     })?;
     Ok((status, retry_after, payload))
+}
+
+fn response_body_limit(path: &str) -> usize {
+    if path == "/vpn/v2" {
+        MAX_SERVER_CATALOG_BYTES
+    } else {
+        MAX_API_RESPONSE_BYTES
+    }
 }
 
 fn invalid_response_error(
@@ -912,6 +921,23 @@ fn invalid_api_response(field: &str) -> NativeError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_the_server_catalog_gets_the_large_response_budget() {
+        assert_eq!(response_body_limit("/vpn/v2"), MAX_SERVER_CATALOG_BYTES);
+        assert_eq!(
+            response_body_limit("/vpn/v2/clientconfig"),
+            MAX_API_RESPONSE_BYTES
+        );
+        assert_eq!(
+            response_body_limit("/auth/v4/sessions"),
+            MAX_API_RESPONSE_BYTES
+        );
+        assert_eq!(
+            response_body_limit("/core/v4/reports/bug"),
+            MAX_API_RESPONSE_BYTES
+        );
+    }
 
     #[tokio::test]
     #[ignore = "contacts Proton DNS-over-HTTPS and API endpoints"]
