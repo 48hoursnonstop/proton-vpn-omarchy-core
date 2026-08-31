@@ -1,4 +1,4 @@
-# proton-omarchy-agent — plugin-first 0.9.0
+# proton-omarchy-agent — plugin-first 0.9.1
 
 Per-user Rust service on `$XDG_RUNTIME_DIR/proton-omarchy.sock`.
 

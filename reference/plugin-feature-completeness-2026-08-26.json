@@ -1,5 +1,5 @@
 {
-  "checkpoint": "0.9.0-windows-parity-follow-up",
+  "checkpoint": "0.9.1-windows-parity-follow-up",
   "audited_at": "2026-08-28",
   "decision": "COMPLETE_TO_DECLARED_PRODUCT_SCOPE_EXCEPT_CRASH_UPLOAD",
   "backend": {
