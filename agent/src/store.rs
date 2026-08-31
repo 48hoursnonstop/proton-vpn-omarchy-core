@@ -24,6 +24,14 @@ const MAX_EXCLUDED_LOCATIONS: usize = 256;
 const MAX_UNPINNED_RECENTS: usize = 6;
 const MAX_PAGE_SIZE: usize = 100;
 const LEGACY_SCOPE: &str = "legacy-unscoped";
+const OFFICIAL_DEFAULT_PROFILE_IDS: [&str; 6] = [
+    "proton-default-streaming-v1",
+    "proton-default-gaming-v1",
+    "proton-default-p2p-v1",
+    "proton-default-max-security-v1",
+    "proton-default-work-school-v1",
+    "proton-default-random-v1",
+];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -64,7 +72,7 @@ impl Default for Onboarding {
     fn default() -> Self {
         Self {
             complete: false,
-            locale: "es-MX".into(),
+            locale: "en".into(),
             start_with_omarchy: true,
             auto_connect: false,
             notifications_enabled: true,
@@ -78,6 +86,7 @@ impl Default for Onboarding {
 struct MigrationState {
     legacy_qt_store_imported: bool,
     copied_to_account_keys: Vec<String>,
+    official_default_profiles_seeded_for_accounts: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -146,6 +155,8 @@ impl StoreHandle {
         } else {
             false
         };
+        let default_profiles_seeded = seed_known_accounts_with_official_profiles(&mut data)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.message))?;
 
         let handle = Self {
             inner: Arc::new(Mutex::new(StoreInner {
@@ -157,7 +168,7 @@ impl StoreHandle {
             operations,
         };
 
-        if !existed || migrated {
+        if !existed || migrated || default_profiles_seeded {
             let inner = handle.lock();
             save_store(&inner.path, &inner.data)?;
         }
@@ -212,6 +223,7 @@ impl StoreHandle {
                     .push(account_key.clone());
             }
         }
+        seed_account_with_official_profiles(&mut inner.data, &account_key)?;
         inner.data.active_account_key = Some(account_key);
         inner.data.revision = inner.data.revision.wrapping_add(1);
         if let Err(error) = save_store(&inner.path, &inner.data) {
@@ -880,6 +892,9 @@ fn resolved_profile(profile: &Value, selection_type: &str) -> BackendResult {
     copy_nonempty_string(object, &mut target, "gatewayName", "gateway_name");
     match kind.as_str() {
         "fastest" | "country" | "state" | "city" | "server" | "gateway" | "gatewayServer" => {}
+        "random" => {
+            target.insert("random".into(), Value::Bool(true));
+        }
         "p2p" => {
             target.insert("p2p".into(), Value::Bool(true));
         }
@@ -895,6 +910,36 @@ fn resolved_profile(profile: &Value, selection_type: &str) -> BackendResult {
                 "Profile connection target is unsupported",
             ));
         }
+    }
+
+    let selection_strategy = object
+        .get("selectionStrategy")
+        .and_then(Value::as_str)
+        .unwrap_or(if kind == "random" {
+            "random"
+        } else {
+            "fastest"
+        });
+    if selection_strategy == "random" && kind != "random" {
+        let explicitly_scoped = ["countryCode", "state", "city", "gatewayName"]
+            .iter()
+            .any(|key| nonempty(object, key));
+        target.insert(
+            if explicitly_scoped {
+                "random_server"
+            } else {
+                "random"
+            }
+            .into(),
+            Value::Bool(true),
+        );
+    }
+    if object
+        .get("excludeMyCountry")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        target.insert("exclude_my_country".into(), Value::Bool(true));
     }
 
     let profile_id = required_string(object, "id", 128)?;
@@ -923,6 +968,7 @@ fn resolved_profile(profile: &Value, selection_type: &str) -> BackendResult {
     Ok(json!({
         "selection": { "type": selection_type },
         "connect_params": {
+            "profile_id": profile_id,
             "target": target,
             "profile_settings": {
                 "protocol": object.get("profileProtocol").and_then(Value::as_str).unwrap_or("smart"),
@@ -971,6 +1017,23 @@ fn normalize_profile(
     let mut profile = Map::new();
     let name = required_string(raw, "name", 60)?;
     let target_kind = string_or(raw, "targetKind", "fastest", 32)?;
+    let selection_strategy = string_or(
+        raw,
+        "selectionStrategy",
+        if target_kind == "random" {
+            "random"
+        } else {
+            "fastest"
+        },
+        16,
+    )?
+    .to_ascii_lowercase();
+    if !["fastest", "random"].contains(&selection_strategy.as_str()) {
+        return Err(BackendError::new(
+            "invalid_profile_target",
+            "Profile selection strategy is unsupported",
+        ));
+    }
     insert_profile_string(raw, &mut profile, "countryCode", 2, true)?;
     insert_profile_string(raw, &mut profile, "countryName", 128, false)?;
     insert_profile_string(raw, &mut profile, "entryCountryCode", 2, true)?;
@@ -1013,6 +1076,14 @@ fn normalize_profile(
     profile.insert("id".into(), Value::String(id.into()));
     profile.insert("name".into(), Value::String(name));
     profile.insert("targetKind".into(), Value::String(target_kind));
+    profile.insert(
+        "selectionStrategy".into(),
+        Value::String(selection_strategy),
+    );
+    profile.insert(
+        "excludeMyCountry".into(),
+        Value::Bool(optional_bool(raw, "excludeMyCountry", false)?),
+    );
     profile.insert(
         "iconName".into(),
         Value::String(string_or(raw, "iconName", "Speed", 64)?),
@@ -1236,7 +1307,7 @@ fn insert_profile_string(
 
 fn profile_target_valid(kind: &str, value: &Map<String, Value>) -> bool {
     match kind {
-        "fastest" | "p2p" | "tor" => true,
+        "fastest" | "random" | "p2p" | "tor" => true,
         "secureCore" => !nonempty(value, "entryCountryCode") || nonempty(value, "countryCode"),
         "country" => nonempty(value, "countryCode"),
         "state" => nonempty(value, "countryCode") && nonempty(value, "state"),
@@ -1695,6 +1766,150 @@ fn account_mut(data: &mut StoreFile) -> &mut AccountStore {
     data.accounts.entry(key).or_default()
 }
 
+fn seed_known_accounts_with_official_profiles(data: &mut StoreFile) -> Result<bool, BackendError> {
+    let account_keys = data.accounts.keys().cloned().collect::<Vec<_>>();
+    let mut changed = false;
+    for account_key in account_keys {
+        changed |= seed_account_with_official_profiles(data, &account_key)?;
+    }
+    Ok(changed)
+}
+
+fn seed_account_with_official_profiles(
+    data: &mut StoreFile,
+    account_key: &str,
+) -> Result<bool, BackendError> {
+    if data
+        .migration
+        .official_default_profiles_seeded_for_accounts
+        .iter()
+        .any(|key| key == account_key)
+    {
+        return Ok(false);
+    }
+
+    let templates = official_default_profiles(&data.onboarding.locale)?;
+    let account = data.accounts.entry(account_key.into()).or_default();
+    let mut changed = false;
+    for profile in templates {
+        let id = profile
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let already_exists = account
+            .profiles
+            .iter()
+            .any(|existing| existing.get("id").and_then(Value::as_str) == Some(id));
+        if !already_exists && account.profiles.len() < MAX_PROFILES {
+            account.profiles.push(profile);
+            changed = true;
+        }
+    }
+
+    let complete = OFFICIAL_DEFAULT_PROFILE_IDS.iter().all(|id| {
+        account
+            .profiles
+            .iter()
+            .any(|profile| profile.get("id").and_then(Value::as_str) == Some(*id))
+    });
+    if complete {
+        data.migration
+            .official_default_profiles_seeded_for_accounts
+            .push(account_key.into());
+        changed = true;
+    }
+    Ok(changed)
+}
+
+// Mirrors ProtonVPN/win-app DefaultProfilesProvider.cs at upstream commit
+// 4d9ac60d1db5d3f2908498470a9d1646723afcfd. Profiles stay ordinary user
+// records so they can be edited or deleted after the one-time seed.
+fn official_default_profiles(locale: &str) -> Result<Vec<Value>, BackendError> {
+    let spanish = locale
+        .replace('_', "-")
+        .split('-')
+        .next()
+        .is_some_and(|language| language.eq_ignore_ascii_case("es"));
+    let names = if spanish {
+        [
+            "Streaming EE. UU.",
+            "Juegos",
+            "P2P",
+            "Seguridad máxima",
+            "Trabajo/Escuela",
+            "Conexión aleatoria",
+        ]
+    } else {
+        [
+            "Streaming US",
+            "Gaming",
+            "P2P",
+            "Max security",
+            "Work/School",
+            "Random connection",
+        ]
+    };
+    let united_states = if spanish {
+        "Estados Unidos"
+    } else {
+        "United States"
+    };
+    let raw_profiles = [
+        json!({
+            "name": names[0],
+            "targetKind": "country",
+            "countryCode": "US",
+            "countryName": united_states,
+            "iconName": "Streaming"
+        }),
+        json!({
+            "name": names[1],
+            "targetKind": "p2p",
+            "iconName": "Gaming",
+            "profileNatType": "moderate"
+        }),
+        json!({
+            "name": names[2],
+            "targetKind": "p2p",
+            "iconName": "Download",
+            "profilePortForwardingEnabled": true
+        }),
+        json!({
+            "name": names[3],
+            "targetKind": "secureCore",
+            "iconName": "Protection"
+        }),
+        json!({
+            "name": names[4],
+            "targetKind": "fastest",
+            "iconName": "Business",
+            "profileProtocol": "protun-tls",
+            "profileNetShieldEnabled": true,
+            "profileNetShieldLevel": 1,
+            "profileNatType": "moderate"
+        }),
+        json!({
+            "name": names[5],
+            "targetKind": "random",
+            "iconName": "Browsing"
+        }),
+    ];
+
+    raw_profiles
+        .iter()
+        .zip(OFFICIAL_DEFAULT_PROFILE_IDS)
+        .map(|(raw, id)| {
+            let object = raw.as_object().ok_or_else(|| {
+                BackendError::new(
+                    "default_profile_invalid",
+                    "An official default profile template is invalid",
+                )
+            })?;
+            normalize_profile(object, None, id).map(Value::Object)
+        })
+        .collect()
+}
+
 fn account_fingerprint(account_name: &str) -> String {
     let mut hash = 0xcbf29ce484222325_u64;
     for byte in account_name.trim().to_lowercase().as_bytes() {
@@ -1972,6 +2187,57 @@ mod tests {
     }
 
     #[test]
+    fn official_default_profiles_match_the_windows_contract() {
+        let mut data = StoreFile::default();
+        data.onboarding.locale = "es-MX".into();
+        data.accounts
+            .insert("account-test".into(), AccountStore::default());
+
+        assert!(
+            seed_account_with_official_profiles(&mut data, "account-test")
+                .expect("seed official defaults")
+        );
+        let account = data.accounts.get("account-test").unwrap();
+        assert_eq!(account.profiles.len(), 6);
+        assert_eq!(account.profiles[0]["name"], "Streaming EE. UU.");
+        assert_eq!(account.profiles[0]["countryCode"], "US");
+        assert_eq!(account.profiles[0]["countryName"], "Estados Unidos");
+        assert_eq!(account.profiles[1]["name"], "Juegos");
+        assert_eq!(account.profiles[1]["targetKind"], "p2p");
+        assert_eq!(account.profiles[1]["profileNatType"], "moderate");
+        assert_eq!(account.profiles[2]["profilePortForwardingEnabled"], true);
+        assert_eq!(account.profiles[3]["targetKind"], "secureCore");
+        assert_eq!(account.profiles[4]["profileProtocol"], "protun-tls");
+        assert_eq!(account.profiles[4]["profileNetShieldLevel"], 1);
+        assert_eq!(account.profiles[4]["profileNatType"], "moderate");
+        assert_eq!(account.profiles[5]["targetKind"], "random");
+
+        let resolved = resolved_profile(&account.profiles[5], "profile")
+            .expect("resolve random default profile");
+        assert_eq!(resolved["connect_params"]["target"]["random"], true);
+    }
+
+    #[test]
+    fn deleted_official_defaults_are_not_seeded_again() {
+        let mut data = StoreFile::default();
+        data.accounts
+            .insert("account-test".into(), AccountStore::default());
+        seed_account_with_official_profiles(&mut data, "account-test")
+            .expect("seed official defaults");
+        data.accounts
+            .get_mut("account-test")
+            .unwrap()
+            .profiles
+            .retain(|profile| profile["id"] != OFFICIAL_DEFAULT_PROFILE_IDS[0]);
+
+        assert!(
+            !seed_account_with_official_profiles(&mut data, "account-test")
+                .expect("do not restore deleted defaults")
+        );
+        assert_eq!(data.accounts["account-test"].profiles.len(), 5);
+    }
+
+    #[test]
     fn recent_normalization_is_allowlisted_and_bounded() {
         let raw = json!({
             "kind": "country",
@@ -2083,6 +2349,7 @@ mod tests {
 
         let resolved = resolved_profile(&Value::Object(profile), "profile")
             .expect("resolve inherited policies");
+        assert_eq!(resolved["connect_params"]["profile_id"], "profile-existing");
         assert!(resolved["connect_params"]["profile_settings"]["allow_lan_connections"].is_null());
         assert!(resolved["connect_params"]["profile_settings"]["allow_local_dns"].is_null());
         assert_eq!(
@@ -2224,6 +2491,49 @@ mod tests {
     }
 
     #[test]
+    fn profile_selection_strategy_is_independent_from_location_and_feature() {
+        let country_random = normalize_profile(
+            json!({
+                "name": "Random Mexico",
+                "targetKind": "country",
+                "countryCode": "mx",
+                "selectionStrategy": "random"
+            })
+            .as_object()
+            .unwrap(),
+            None,
+            "profile-random-mx",
+        )
+        .expect("normalize scoped random profile");
+        assert_eq!(country_random["countryCode"], "MX");
+        assert_eq!(country_random["selectionStrategy"], "random");
+        let resolved = resolved_profile(&Value::Object(country_random), "profile")
+            .expect("resolve scoped random profile");
+        assert_eq!(resolved["connect_params"]["target"]["country_code"], "MX");
+        assert_eq!(resolved["connect_params"]["target"]["random_server"], true);
+        assert!(resolved["connect_params"]["target"]["random"].is_null());
+
+        let anti_censorship = normalize_profile(
+            json!({
+                "name": "Anti-censorship",
+                "targetKind": "fastest",
+                "excludeMyCountry": true
+            })
+            .as_object()
+            .unwrap(),
+            None,
+            "profile-away",
+        )
+        .expect("normalize excluding profile");
+        let resolved = resolved_profile(&Value::Object(anti_censorship), "profile")
+            .expect("resolve excluding profile");
+        assert_eq!(
+            resolved["connect_params"]["target"]["exclude_my_country"],
+            true
+        );
+    }
+
+    #[test]
     fn hierarchical_recents_keep_state_and_city_in_their_identity() {
         let washington = normalize_recent(
             json!({
@@ -2262,6 +2572,7 @@ mod tests {
 
     #[test]
     fn locale_storage_accepts_bounded_bcp47_tags_and_canonicalizes_them() {
+        assert_eq!(Onboarding::default().locale, "en");
         assert_eq!(locale_value(Some(&json!("es_mx"))).unwrap(), "es-MX");
         assert_eq!(
             locale_value(Some(&json!("zh-hant-tw"))).unwrap(),

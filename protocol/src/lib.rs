@@ -19,7 +19,6 @@ pub const BACKEND_METHODS: &[&str] = &[
     "report_issue.submit",
     "diagnostics.get",
     "account.login",
-    "account.login_guest",
     "account.submit_2fa",
     "account.authenticate_fido2",
     "account.submit_fido2_pin",
@@ -27,6 +26,7 @@ pub const BACKEND_METHODS: &[&str] = &[
     "account.logout",
     "locations.get",
     "servers.get",
+    "servers.lookup",
     "feature.set",
     "protocol.set",
     "dns.set",
@@ -210,6 +210,15 @@ pub struct ConnectTarget {
     pub tor: bool,
     #[serde(default)]
     pub random: bool,
+    /// Choose a random logical server after applying the explicit location
+    /// filters. This is distinct from `random`, which chooses a country
+    /// uniformly and then uses that country's best server.
+    #[serde(default)]
+    pub random_server: bool,
+    /// Exclude the country reported by Proton for the current physical
+    /// connection while resolving an automatic country target.
+    #[serde(default)]
+    pub exclude_my_country: bool,
     #[serde(default)]
     pub free_random: bool,
 }
@@ -239,6 +248,9 @@ pub struct ServersGetParams {
     pub gateway_name: String,
     #[serde(default)]
     pub feature: String,
+    /// Optional catalog partition: `consumer`, `gateways`, or `all`.
+    #[serde(default)]
+    pub scope: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -336,7 +348,7 @@ impl Default for CanonicalStoreState {
             revision: 0,
             ready: false,
             onboarding_complete: false,
-            locale: "es-MX".into(),
+            locale: "en".into(),
             start_with_omarchy: true,
             auto_connect: false,
             notifications_enabled: true,
@@ -478,6 +490,9 @@ impl Default for BackendState {
 pub struct ConnectionState {
     pub observation_known: bool,
     pub status: ConnectionStatus,
+    /// Exact store profile that created the active tunnel, when applicable.
+    #[serde(default)]
+    pub profile_id: Option<String>,
     pub country_code: Option<String>,
     pub country_name: Option<String>,
     pub entry_country_code: Option<String>,
@@ -512,6 +527,7 @@ impl Default for ConnectionState {
         Self {
             observation_known: false,
             status: ConnectionStatus::Unknown,
+            profile_id: None,
             country_code: None,
             country_name: None,
             entry_country_code: None,

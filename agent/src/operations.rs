@@ -304,7 +304,7 @@ impl OperationCoordinator {
 
 fn operation_spec(method: &str) -> Option<OperationSpec> {
     let spec = match method {
-        "account.login" | "account.login_guest" => (
+        "account.login" => (
             OperationDomain::AuthSession,
             "auth.submitting_credentials",
             false,
@@ -467,6 +467,7 @@ fn requires_stable_session(method: &str) -> bool {
             | "report_issue.categories.get"
             | "locations.get"
             | "servers.get"
+            | "servers.lookup"
             | "apps.get"
             | "connection.observe"
             | "traffic.get"
@@ -475,10 +476,7 @@ fn requires_stable_session(method: &str) -> bool {
 
 fn completion_stage(method: &str) -> &'static str {
     match method {
-        "account.login"
-        | "account.login_guest"
-        | "account.submit_2fa"
-        | "account.authenticate_fido2" => "auth.complete",
+        "account.login" | "account.submit_2fa" | "account.authenticate_fido2" => "auth.complete",
         "account.logout" => "auth.signed_out",
         "connection.connect" => "tunnel.connected",
         "connection.disconnect" | "connection.cancel" => "tunnel.disconnected",
@@ -499,7 +497,6 @@ fn completion_stage(method: &str) -> &'static str {
 fn failure_stage(method: &str) -> &'static str {
     match method {
         "account.login" => "auth.credentials_failed",
-        "account.login_guest" => "auth.guest_session_failed",
         "account.submit_2fa" => "auth.two_factor_failed",
         "account.authenticate_fido2" => "auth.security_key_failed",
         "account.logout" => "auth.logout_failed",

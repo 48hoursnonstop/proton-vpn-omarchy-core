@@ -14,6 +14,11 @@ The packaged plugin snapshot reuses or translates selected GPL-licensed icon
 geometry and status assets from the Proton VPN Android and Proton Core Android
 projects. Those assets retain their upstream copyright and license terms.
 
+The one-time default connection-profile definitions mirror the GPL-licensed
+Proton VPN Windows client at commit
+`4d9ac60d1db5d3f2908498470a9d1646723afcfd`. They are normalized into this
+project's canonical profile schema and remain editable user records.
+
 The runtime integrates with the separately installed official Proton Linux API
 core and ProTun NetworkManager service. Those Python packages and ProTun itself
 are not redistributed in this repository.

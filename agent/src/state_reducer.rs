@@ -435,8 +435,26 @@ pub(crate) fn apply_event(
                     "error" => ConnectionStatus::Error,
                     _ => ConnectionStatus::Unknown,
                 };
+                state.connection.profile_id = data
+                    .get("profile_id")
+                    .and_then(Value::as_str)
+                    .filter(|value| {
+                        !value.is_empty()
+                            && value.len() <= 128
+                            && !value.chars().any(char::is_control)
+                    })
+                    .map(str::to_owned);
 
                 let server = data.get("server").and_then(Value::as_object);
+                let secure_core = data
+                    .get("secure_core")
+                    .and_then(Value::as_bool)
+                    .or_else(|| {
+                        server
+                            .and_then(|server| server.get("secure_core"))
+                            .and_then(Value::as_bool)
+                    })
+                    .unwrap_or(false);
                 state.connection.country_code = server
                     .and_then(|s| s.get("country_code"))
                     .and_then(Value::as_str)
@@ -445,16 +463,12 @@ pub(crate) fn apply_event(
                     .and_then(|s| s.get("country_name"))
                     .and_then(Value::as_str)
                     .map(str::to_owned);
-                state.connection.entry_country_code = server
-                    .and_then(|s| s.get("entry_country_code"))
-                    .and_then(Value::as_str)
-                    .filter(|value| !value.is_empty())
-                    .map(str::to_owned);
-                state.connection.entry_country_name = server
-                    .and_then(|s| s.get("entry_country_name"))
-                    .and_then(Value::as_str)
-                    .filter(|value| !value.is_empty())
-                    .map(str::to_owned);
+                state.connection.entry_country_code = secure_core
+                    .then(|| server_string(server, "entry_country_code"))
+                    .flatten();
+                state.connection.entry_country_name = secure_core
+                    .then(|| server_string(server, "entry_country_name"))
+                    .flatten();
                 state.connection.state = server
                     .and_then(|s| s.get("state"))
                     .and_then(Value::as_str)
@@ -517,9 +531,7 @@ pub(crate) fn apply_event(
                     state.connection.network_conflicts.clear();
                 }
 
-                if let Some(secure_core) = data.get("secure_core").and_then(Value::as_bool) {
-                    state.features.secure_core = secure_core;
-                }
+                state.features.secure_core = secure_core;
 
                 if state.connection.status == ConnectionStatus::Connected
                     && previous_status != ConnectionStatus::Connected
@@ -554,6 +566,14 @@ fn string_array(object: &serde_json::Map<String, Value>, key: &str) -> Vec<Strin
         .unwrap_or_default()
 }
 
+fn server_string(server: Option<&serde_json::Map<String, Value>>, key: &str) -> Option<String> {
+    server
+        .and_then(|server| server.get(key))
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
 fn now_unix_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -561,4 +581,30 @@ fn now_unix_ms() -> u64 {
         .as_millis()
         .try_into()
         .unwrap_or(u64::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn entry_country_is_only_connection_metadata_for_secure_core() {
+        let server = json!({
+            "country_code": "MX",
+            "entry_country_code": "MX",
+            "entry_country_name": "Mexico",
+        });
+        let server = server.as_object();
+
+        let standard_entry = false
+            .then(|| server_string(server, "entry_country_code"))
+            .flatten();
+        let secure_core_entry = true
+            .then(|| server_string(server, "entry_country_code"))
+            .flatten();
+
+        assert_eq!(standard_entry, None);
+        assert_eq!(secure_core_entry.as_deref(), Some("MX"));
+    }
 }

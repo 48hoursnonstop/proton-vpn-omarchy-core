@@ -23,7 +23,7 @@ use crate::{
     store::StoreHandle,
 };
 use api::{ApiSession, ProtonApi};
-use catalog::ConnectionTarget;
+use catalog::{canonical_server_lookup_query, compact_server_name, ConnectionTarget};
 use ipnet::IpNet;
 use local_agent::{AgentSnapshot, AgentUpdate, RunningAgent};
 use models::{ClientConfig, NativeSettings, ServerCatalog, SessionData, SplitTunnelingConfig};
@@ -560,7 +560,6 @@ impl NativeRuntime {
             "report_issue.categories.get" => self.report_issue_categories().await,
             "report_issue.submit" => self.report_issue_submit(params).await,
             "account.login" => self.account_login(params).await,
-            "account.login_guest" => self.account_login_guest().await,
             "account.submit_2fa" => self.account_submit_2fa(params).await,
             "account.authenticate_fido2" => self.account_authenticate_fido2().await,
             "account.submit_fido2_pin" => self.account_submit_fido2_pin(params).await,
@@ -568,6 +567,7 @@ impl NativeRuntime {
             "account.logout" => self.account_logout().await,
             "locations.get" => self.locations().await,
             "servers.get" => self.servers(&params).await,
+            "servers.lookup" => self.server_lookup(&params).await,
             "protocol.set" => self.protocol_set(params).await,
             "feature.set" => self.feature_set(params).await,
             "dns.set" => self.dns_set(params).await,
@@ -774,52 +774,6 @@ impl NativeRuntime {
         }))
     }
 
-    async fn account_login_guest(&self) -> NativeResult<Value> {
-        let _auth = self.auth_write.lock().await;
-        if let Some(session) = self.state.read().await.session.as_ref() {
-            return Ok(json!({
-                "success": true,
-                "authenticated": true,
-                "credentialless": session.credentialless,
-                "two_factor_required": false,
-            }));
-        }
-
-        self.events.emit(
-            "account",
-            json!({
-                "status": "signing_in",
-                "name": null,
-                "tier": null,
-                "credentialless": true,
-                "two_factor_code_supported": false,
-                "two_factor_security_key_supported": false,
-                "sso_supported": false,
-            }),
-        );
-        self.events
-            .stage("account.login_guest", "auth.creating_guest_session", false);
-        let auth = match self.api.authenticate_guest().await {
-            Ok(auth) => auth,
-            Err(error) => {
-                self.emit_account().await;
-                return Err(error);
-            }
-        };
-        self.events
-            .stage("account.login_guest", "auth.finalizing", false);
-        if let Err(error) = self.finalize_auth(auth, "account.login_guest").await {
-            self.emit_account().await;
-            return Err(error);
-        }
-        Ok(json!({
-            "success": true,
-            "authenticated": true,
-            "credentialless": true,
-            "two_factor_required": false,
-        }))
-    }
-
     async fn account_submit_2fa(&self, mut params: Value) -> NativeResult<Value> {
         let _auth = self.auth_write.lock().await;
         let code = Zeroizing::new(take_required_param(&mut params, "code", 32, true)?);
@@ -995,10 +949,16 @@ impl NativeRuntime {
             .await
             .map_err(|error| login_error(error, "account"))?;
 
+        let session_bootstrap::BootstrapData {
+            session,
+            catalog,
+            catalog_json,
+            client_config,
+            client_config_json,
+        } = bootstrap;
+
         let catalog_path = self.paths.catalog.clone();
         let client_config_path = self.paths.client_config.clone();
-        let catalog_json = bootstrap.catalog_json.clone();
-        let client_config_json = bootstrap.client_config_json.clone();
         tokio::task::spawn_blocking(move || {
             settings_store::save_value(&catalog_path, &catalog_json)?;
             settings_store::save_value(&client_config_path, &client_config_json)
@@ -1007,15 +967,15 @@ impl NativeRuntime {
         .map_err(join_error)??;
 
         let secret_store = self.secret_store.clone();
-        let session_for_store = bootstrap.session.clone();
+        let session_for_store = session.clone();
         tokio::task::spawn_blocking(move || secret_store.save(&session_for_store))
             .await
             .map_err(join_error)??;
         {
             let mut state = self.state.write().await;
-            state.session = Some(bootstrap.session);
-            state.catalog = Some(bootstrap.catalog);
-            state.client_config = Some(bootstrap.client_config);
+            state.session = Some(session);
+            state.catalog = Some(catalog);
+            state.client_config = Some(client_config);
         }
         self.pending_auth.lock().await.take();
         self.refresh_connection_feedback_flag().await;
@@ -2050,6 +2010,60 @@ impl NativeRuntime {
         catalog.servers_page(params, tier)
     }
 
+    async fn server_lookup(&self, params: &Value) -> NativeResult<Value> {
+        let query = params.get("query").and_then(Value::as_str).unwrap_or("");
+        let canonical = canonical_server_lookup_query(query).ok_or_else(|| {
+            NativeError::new(
+                "invalid_params",
+                "query must be a complete Proton server name",
+            )
+        })?;
+        let compact_query = compact_server_name(&canonical);
+        let (stored_session, tier) = self.require_session().await?;
+
+        if let Some(server) = self
+            .state
+            .read()
+            .await
+            .catalog
+            .as_ref()
+            .and_then(|catalog| {
+                catalog.logical_servers.iter().find(|server| {
+                    server.tier <= tier && compact_server_name(&server.name) == compact_query
+                })
+            })
+            .cloned()
+        {
+            return Ok(json!({
+                "query": canonical,
+                "remote": false,
+                "server": server.serialized(),
+            }));
+        }
+
+        let api_session = session_bootstrap::stored_api_session(&stored_session);
+        let Some(server) = self.api.lookup_server(&canonical, &api_session).await? else {
+            return Ok(json!({ "query": canonical, "remote": true, "server": null }));
+        };
+        if server.tier > tier {
+            return Ok(json!({ "query": canonical, "remote": true, "server": null }));
+        }
+
+        let serialized = server.serialized();
+        let mut state = self.state.write().await;
+        let catalog = state.catalog.as_mut().ok_or_else(catalog_unavailable)?;
+        if let Some(existing) = catalog
+            .logical_servers
+            .iter_mut()
+            .find(|candidate| candidate.id == server.id)
+        {
+            *existing = server;
+        } else {
+            catalog.logical_servers.push(server);
+        }
+        Ok(json!({ "query": canonical, "remote": true, "server": serialized }))
+    }
+
     async fn connection_observe(&self) -> NativeResult<Value> {
         self.require_session().await?;
         let observation = self.observe_blocking().await?;
@@ -2064,14 +2078,25 @@ impl NativeRuntime {
 
     async fn connection_connect(self: &Arc<Self>, params: Value) -> NativeResult<Value> {
         self.refresh_certificate_if_needed().await?;
+        let profile_id = connection_profile_id(&params)?;
         let _network_guard = self.network_write.lock().await;
         let (session, tier) = self.require_session().await?;
         let current = self.observe_blocking().await?;
-        if current.state != TunnelState::Disconnected {
-            return Err(NativeError::new(
-                "connection_active",
-                "Disconnect the active VPN connection before starting another one",
-            ));
+        let owned_uuid = self.owned_connection_uuid.lock().await.clone();
+        if let Some(uuid) = replacement_connection_uuid(&current, owned_uuid.as_deref())? {
+            // Profile, recent and location selection are replacement actions in
+            // Proton's clients. Keep them a single foreground operation while
+            // still refusing to tear down a tunnel owned by another client.
+            self.events
+                .stage("connection.connect", "tunnel.disconnecting", true);
+            self.disconnect_owned_inner(&uuid).await?;
+            if self.observe_blocking().await?.state != TunnelState::Disconnected {
+                return Err(NativeError::new(
+                    "disconnect_failed",
+                    "The active VPN connection did not stop before reconnecting",
+                )
+                .retryable(true));
+            }
         }
         self.state.write().await.pending_connection_trigger = connection_trigger(&params).into();
         self.events
@@ -2088,7 +2113,12 @@ impl NativeRuntime {
             let (settings, protocol, profile_settings_applied) =
                 effective_connection_settings(&params, &global_settings, tier)?;
             let excluded_locations = self.events.store.excluded_locations();
-            let target = catalog.select(&params, tier, &excluded_locations)?;
+            let target = catalog.select(
+                &params,
+                tier,
+                &excluded_locations,
+                &session.vpn.location.country,
+            )?;
             (
                 target,
                 client_config,
@@ -2099,7 +2129,14 @@ impl NativeRuntime {
             )
         };
 
-        let profile = VpnProfile::new(&target, &protocol, &session, &client_config, &settings)?;
+        let profile = VpnProfile::new(
+            &target,
+            &protocol,
+            &session,
+            &client_config,
+            &settings,
+            profile_id.clone(),
+        )?;
         let conflict_network = self.network.clone();
         let network_conflicts = tokio::task::spawn_blocking(move || {
             conflict_network
@@ -2118,6 +2155,7 @@ impl NativeRuntime {
             json!({
                 "observation_known": true,
                 "status": "connecting",
+                "profile_id": profile_id,
                 "server": target.logical.serialized(),
                 "protocol": protocol,
                 "secure_core": target.logical.features & models::FEATURE_SECURE_CORE != 0,
@@ -2170,6 +2208,7 @@ impl NativeRuntime {
                     json!({
                         "observation_known": true,
                         "status": "error",
+                        "profile_id": profile_id,
                         "server": target.logical.serialized(),
                         "protocol": protocol,
                         "secure_core": target.logical.features & models::FEATURE_SECURE_CORE != 0,
@@ -2722,6 +2761,7 @@ impl NativeRuntime {
             json!({
                 "observation_known": true,
                 "status": tunnel_state_name(observation.state),
+                "profile_id": observation.profile_id,
                 "server": server,
                 "protocol": protocol,
                 "secure_core": secure_core,
@@ -3832,6 +3872,44 @@ fn error_message(error: &NativeError) -> BackendError {
     BackendError::new(&error.code, &error.message).retryable(error.retryable)
 }
 
+fn replacement_connection_uuid(
+    observation: &TunnelObservation,
+    owned_uuid: Option<&str>,
+) -> NativeResult<Option<String>> {
+    if observation.state == TunnelState::Disconnected {
+        return Ok(None);
+    }
+
+    match (observation.owned, observation.uuid.as_deref(), owned_uuid) {
+        (true, Some(active_uuid), Some(known_uuid)) if active_uuid == known_uuid => {
+            Ok(Some(active_uuid.to_owned()))
+        }
+        _ => Err(NativeError::new(
+            "connection_active",
+            "The active VPN connection belongs to another client and cannot be replaced",
+        )),
+    }
+}
+
+fn connection_profile_id(params: &Value) -> NativeResult<Option<String>> {
+    let Some(value) = params.get("profile_id") else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    let profile_id = value
+        .as_str()
+        .ok_or_else(|| NativeError::new("invalid_params", "profile_id must be a string"))?;
+    if profile_id.is_empty() || profile_id.len() > 128 || profile_id.chars().any(char::is_control) {
+        return Err(NativeError::new(
+            "invalid_params",
+            "profile_id must contain 1 to 128 non-control bytes",
+        ));
+    }
+    Ok(Some(profile_id.to_owned()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3842,6 +3920,49 @@ mod tests {
         assert_eq!(normalized_protocol("wireguard"), "protun-udp");
         assert_eq!(normalized_protocol("wireguard-tcp"), "protun-tcp");
         assert_eq!(normalized_protocol("stealth"), "protun-tls");
+    }
+
+    #[test]
+    fn connection_selection_replaces_only_an_owned_tunnel() {
+        let disconnected = TunnelObservation {
+            state: TunnelState::Disconnected,
+            active_path: None,
+            connection_path: None,
+            id: None,
+            uuid: None,
+            protocol: None,
+            endpoint: None,
+            profile_id: None,
+            owned: false,
+        };
+        assert_eq!(
+            replacement_connection_uuid(&disconnected, None).unwrap(),
+            None
+        );
+
+        let owned = TunnelObservation {
+            state: TunnelState::Connected,
+            uuid: Some("owned-uuid".into()),
+            owned: true,
+            ..disconnected.clone()
+        };
+        assert_eq!(
+            replacement_connection_uuid(&owned, Some("owned-uuid")).unwrap(),
+            Some("owned-uuid".into())
+        );
+
+        let foreign = TunnelObservation {
+            state: TunnelState::Connected,
+            uuid: Some("foreign-uuid".into()),
+            owned: false,
+            ..disconnected
+        };
+        assert_eq!(
+            replacement_connection_uuid(&foreign, Some("owned-uuid"))
+                .unwrap_err()
+                .code,
+            "connection_active"
+        );
     }
 
     #[test]

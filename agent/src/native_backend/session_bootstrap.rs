@@ -89,8 +89,11 @@ pub async fn fetch(
         .await?;
     insert_number(&mut catalog_json, "ExpirationTime", now + 3.0 * 60.0 * 60.0)?;
     insert_number(&mut catalog_json, "LoadsExpirationTime", now + 15.0 * 60.0)?;
-    insert_number(&mut catalog_json, "MaxTier", f64::from(tier))?;
-    let catalog: ServerCatalog = decode_api_value(catalog_json.clone(), "VPN server catalog")?;
+    insert_u64(&mut catalog_json, "MaxTier", u64::from(tier))?;
+    // Deserialize from the borrowed JSON tree. Cloning a production catalog
+    // multiplies peak memory use during login and gets increasingly expensive
+    // as Proton adds servers.
+    let catalog: ServerCatalog = decode_api_value_ref(&catalog_json, "VPN server catalog")?;
 
     let session = SessionData {
         uid: auth.uid,
@@ -250,6 +253,19 @@ fn decode_api_value<T: serde::de::DeserializeOwned>(value: Value, name: &str) ->
     })
 }
 
+fn decode_api_value_ref<T: serde::de::DeserializeOwned>(
+    value: &Value,
+    name: &str,
+) -> NativeResult<T> {
+    T::deserialize(value).map_err(|error| {
+        NativeError::new(
+            "api_response_invalid",
+            format!("Proton returned an invalid {name}"),
+        )
+        .with_source(error)
+    })
+}
+
 fn without_api_code(mut value: Value) -> Value {
     if let Some(object) = value.as_object_mut() {
         object.remove("Code");
@@ -270,6 +286,17 @@ fn insert_number(value: &mut Value, key: &str, number: f64) -> NativeResult<()> 
             .map(Value::Number)
             .ok_or_else(|| NativeError::new("clock_invalid", "System clock is invalid"))?,
     );
+    Ok(())
+}
+
+fn insert_u64(value: &mut Value, key: &str, number: u64) -> NativeResult<()> {
+    let object = value.as_object_mut().ok_or_else(|| {
+        NativeError::new(
+            "api_response_invalid",
+            "Proton returned an API response that is not an object",
+        )
+    })?;
+    object.insert(key.into(), Value::from(number));
     Ok(())
 }
 
@@ -296,5 +323,19 @@ mod tests {
         assert_eq!(features["NetShieldLevel"], 2);
         assert_eq!(features["PortForwarding"], true);
         assert_eq!(features["RandomNAT"], false);
+    }
+
+    #[test]
+    fn server_catalog_decodes_after_account_tier_is_injected() {
+        let mut value = json!({
+            "Code": 1000,
+            "LogicalServers": []
+        });
+        insert_u64(&mut value, "MaxTier", 2).expect("account tier");
+        assert!(value["MaxTier"].is_u64());
+        let catalog: ServerCatalog =
+            decode_api_value_ref(&value, "VPN server catalog").expect("borrowed catalog");
+        assert_eq!(catalog.max_tier, 2);
+        assert!(catalog.logical_servers.is_empty());
     }
 }

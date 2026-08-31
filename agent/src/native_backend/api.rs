@@ -1,6 +1,8 @@
 use super::alternative_routing::{self, AlternativeRoute};
 use super::fido2::FidoAssertion;
-use super::{web_auth, EventSink, NativeError, NativeResult, MAX_SERVER_CATALOG_BYTES};
+use super::{
+    models::LogicalServer, web_auth, EventSink, NativeError, NativeResult, MAX_SERVER_CATALOG_BYTES,
+};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use proton_srp::{SRPAuth, SRPProofB64, SrpHashVersion};
 use reqwest::{cookie::Jar, header, Method, StatusCode};
@@ -18,7 +20,6 @@ use zeroize::Zeroizing;
 
 const API_BASE: &str = "https://vpn-api.proton.me";
 const API_CORE_COMPAT_VERSION: &str = "5.5.11";
-const CREDENTIALLESS_ACCOUNT_NAME: &str = "Proton VPN Guest";
 const MAX_API_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 const TLS_PINS: &[&str] = &[
     "CT56BhOTmj5ZIPgb/xD5mH8rY3BLo/MlhP7oPyJUEDo=",
@@ -260,23 +261,6 @@ impl ProtonApi {
         api_session_from_auth(response, username)
     }
 
-    /// Starts the same persistent credentialless session used by the official
-    /// Android guest mode. It is a normal authenticated API session with Free
-    /// VPN scope, but it has no Proton account credentials attached to it.
-    pub async fn authenticate_guest(&self) -> NativeResult<ApiSession> {
-        let response = self
-            .request(
-                Method::POST,
-                "/auth/v4/credentialless",
-                Some(json!({ "Payload": {} })),
-                None,
-            )
-            .await?;
-        let mut session = api_session_from_auth(response, CREDENTIALLESS_ACCOUNT_NAME.into())?;
-        session.credentialless = true;
-        Ok(session)
-    }
-
     pub async fn submit_2fa(&self, session: &mut ApiSession, code: &str) -> NativeResult<()> {
         let response = self
             .request(
@@ -350,6 +334,32 @@ impl ProtonApi {
 
     pub async fn public_get(&self, endpoint: &str) -> NativeResult<Value> {
         self.request(Method::GET, endpoint, None, None).await
+    }
+
+    pub async fn lookup_server(
+        &self,
+        name: &str,
+        session: &ApiSession,
+    ) -> NativeResult<Option<LogicalServer>> {
+        let encoded_name =
+            url::form_urlencoded::byte_serialize(name.as_bytes()).collect::<String>();
+        let payload = self
+            .get(&format!("/vpn/v1/logicals/lookup/{encoded_name}"), session)
+            .await?;
+        payload
+            .get("LogicalServer")
+            .filter(|value| !value.is_null())
+            .cloned()
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(|error| {
+                NativeError::new(
+                    "api_response_invalid",
+                    "Proton returned an invalid server lookup response",
+                )
+                .with_source(error)
+                .retryable(true)
+            })
     }
 
     pub async fn post(
@@ -741,7 +751,11 @@ async fn decode_api_response(
 }
 
 fn response_body_limit(path: &str) -> usize {
-    if path == "/vpn/v2" {
+    // Account bootstrap and both generations of the logical-server catalog
+    // are the only API responses expected to grow with Proton's fleet. Keep
+    // the larger budget narrowly scoped so authentication, support and other
+    // endpoints retain the 4 MiB denial-of-service guard.
+    if matches!(path, "/vpn/v2" | "/vpn/v1/logicals" | "/vpn/v2/logicals") {
         MAX_SERVER_CATALOG_BYTES
     } else {
         MAX_API_RESPONSE_BYTES
@@ -836,11 +850,6 @@ fn api_session_from_auth(response: Value, account_name: String) -> NativeResult<
 
 fn api_error(status: StatusCode, code: i64, payload: &Value) -> NativeError {
     let (native_code, fallback, retryable) = match (status.as_u16(), code) {
-        (_, 10200) => (
-            "credentialless_unavailable",
-            "Proton guest mode is unavailable for this request",
-            false,
-        ),
         (_, 8002) => (
             "authentication_failed",
             "Incorrect Proton credentials or verification code",
@@ -926,6 +935,14 @@ mod tests {
     fn only_the_server_catalog_gets_the_large_response_budget() {
         assert_eq!(response_body_limit("/vpn/v2"), MAX_SERVER_CATALOG_BYTES);
         assert_eq!(
+            response_body_limit("/vpn/v1/logicals"),
+            MAX_SERVER_CATALOG_BYTES
+        );
+        assert_eq!(
+            response_body_limit("/vpn/v2/logicals"),
+            MAX_SERVER_CATALOG_BYTES
+        );
+        assert_eq!(
             response_body_limit("/vpn/v2/clientconfig"),
             MAX_API_RESPONSE_BYTES
         );
@@ -963,16 +980,5 @@ mod tests {
         validate_tls_pin(&response, route.pins()).unwrap();
         let (_, _, payload) = decode_api_response(response, &route).await.unwrap();
         assert!(payload.get("Code").and_then(Value::as_i64).is_some());
-    }
-
-    #[test]
-    fn credentialless_rejection_has_a_stable_client_error() {
-        let error = api_error(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            10200,
-            &json!({ "Error": "Credentialless session is unavailable" }),
-        );
-        assert_eq!(error.code, "credentialless_unavailable");
-        assert!(!error.retryable);
     }
 }

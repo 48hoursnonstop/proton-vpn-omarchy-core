@@ -15,6 +15,9 @@ use std::{
     io::Read,
     path::Path,
 };
+use unicode_normalization::{char::is_combining_mark, UnicodeNormalization};
+
+const MAX_SERVER_QUERY_BYTES: usize = 256;
 
 #[derive(Clone, Debug)]
 pub struct ConnectionTarget {
@@ -72,10 +75,19 @@ impl ServerCatalog {
     pub fn servers_page(&self, params: &Value, tier: u8) -> NativeResult<Value> {
         let offset = bounded_u64(params.get("offset"), 0, 1_000_000)? as usize;
         let limit = bounded_u64(params.get("limit"), 100, 100)? as usize;
-        let query = string(params, "query").to_ascii_lowercase();
+        let raw_query = string(params, "query");
+        if raw_query.len() > MAX_SERVER_QUERY_BYTES {
+            return Err(NativeError::new(
+                "invalid_params",
+                format!("query must be at most {MAX_SERVER_QUERY_BYTES} bytes"),
+            ));
+        }
+        let query = normalize_search(&raw_query);
+        let compact_query = compact_server_name(&query);
         let country_code = string(params, "country_code").to_ascii_uppercase();
         let gateway_name = string(params, "gateway_name");
         let feature = string(params, "feature").to_ascii_lowercase();
+        let scope = string(params, "scope").to_ascii_lowercase();
         if !["", "all", "standard", "secure_core", "p2p", "tor"].contains(&feature.as_str()) {
             return Err(NativeError::new(
                 "invalid_params",
@@ -88,6 +100,12 @@ impl ServerCatalog {
                 "Gateway and consumer feature filters cannot be combined",
             ));
         }
+        if !["", "all", "consumer", "gateways"].contains(&scope.as_str()) {
+            return Err(NativeError::new(
+                "invalid_params",
+                "Unknown server search scope",
+            ));
+        }
 
         let mut servers = self
             .logical_servers
@@ -95,6 +113,11 @@ impl ServerCatalog {
             .filter(|server| server.tier <= tier)
             .filter(|server| country_code.is_empty() || server.exit_country == country_code)
             .filter(|server| gateway_name.is_empty() || server.gateway_name() == gateway_name)
+            .filter(|server| match scope.as_str() {
+                "consumer" => server.gateway_name().is_empty(),
+                "gateways" => !server.gateway_name().is_empty(),
+                _ => true,
+            })
             .filter(|server| match feature.as_str() {
                 "standard" => server.standard(),
                 "secure_core" => server.features & FEATURE_SECURE_CORE != 0,
@@ -106,25 +129,16 @@ impl ServerCatalog {
                 if query.is_empty() {
                     return true;
                 }
-                let haystack = format!(
-                    "{} {} {} {} {} {} {} {}",
-                    server.name,
-                    server.exit_country,
-                    country_name(&server.exit_country),
-                    server.entry_country,
-                    country_name(&server.entry_country),
-                    server.state,
-                    server.city,
-                    server.region.as_deref().unwrap_or_default(),
-                )
-                .to_ascii_lowercase();
-                haystack.contains(&query)
+                server_name_match_rank(&server.name, &query, &compact_query).is_some()
             })
             .collect::<Vec<_>>();
 
         servers.sort_by(|left, right| {
-            country_name(&left.exit_country)
-                .cmp(&country_name(&right.exit_country))
+            server_name_match_rank(&left.name, &query, &compact_query)
+                .cmp(&server_name_match_rank(&right.name, &query, &compact_query))
+                .then_with(|| {
+                    country_name(&left.exit_country).cmp(&country_name(&right.exit_country))
+                })
                 .then_with(|| {
                     (left.features & FEATURE_SECURE_CORE == 0)
                         .cmp(&(right.features & FEATURE_SECURE_CORE == 0))
@@ -152,6 +166,7 @@ impl ServerCatalog {
             "country_code": country_code,
             "gateway_name": gateway_name,
             "feature": feature,
+            "scope": scope,
             "servers": page,
         }))
     }
@@ -211,6 +226,7 @@ impl ServerCatalog {
                     "name": country_name(&server.exit_country),
                     "server_count": 0,
                     "available_server_count": 0,
+                    "standard": false,
                     "secure_core": false,
                     "p2p": false,
                     "tor": false,
@@ -221,6 +237,7 @@ impl ServerCatalog {
             if server.enabled() {
                 increment(entry, "available_server_count");
             }
+            set_feature(entry, "standard", server.standard());
             set_feature(
                 entry,
                 "secure_core",
@@ -276,6 +293,7 @@ impl ServerCatalog {
         params: &Value,
         tier: u8,
         excluded_locations: &[ExcludedLocation],
+        device_country: &str,
     ) -> NativeResult<ConnectionTarget> {
         let target = params
             .get("target")
@@ -291,6 +309,8 @@ impl ServerCatalog {
         let p2p = object_bool(target, "p2p");
         let tor = object_bool(target, "tor");
         let random_target = object_bool(target, "random");
+        let random_server = object_bool(target, "random_server");
+        let exclude_my_country = object_bool(target, "exclude_my_country");
         let free_random = object_bool(target, "free_random");
         let exclude_server_name = object_string(target, "exclude_server_name");
 
@@ -313,6 +333,20 @@ impl ServerCatalog {
                 "Secure Core entry-country targets require secure_core",
             ));
         }
+        if random_target && random_server {
+            return Err(NativeError::new(
+                "invalid_params",
+                "Country-random and server-random selection cannot be combined",
+            ));
+        }
+        let device_country = device_country.trim().to_ascii_uppercase();
+        if exclude_my_country && device_country.is_empty() {
+            return Err(NativeError::new(
+                "device_location_unavailable",
+                "The current country is unavailable, so it cannot be excluded",
+            )
+            .retryable(true));
+        }
 
         let available = self
             .logical_servers
@@ -331,6 +365,10 @@ impl ServerCatalog {
                 .copied()
                 .filter(|server| gateway_name.is_empty() || server.gateway_name() == gateway_name)
                 .filter(|server| country_code.is_empty() || server.exit_country == country_code)
+                .filter(|server| {
+                    !exclude_my_country
+                        || !server.exit_country.eq_ignore_ascii_case(&device_country)
+                })
                 .filter(|server| {
                     entry_country_code.is_empty()
                         || server
@@ -390,12 +428,16 @@ impl ServerCatalog {
                 let selected_country = countries.choose(&mut rand::rng()).copied();
                 candidates.retain(|server| selected_country == Some(server.exit_country.as_str()));
             }
-            candidates.sort_by(|left, right| {
-                left.score
-                    .partial_cmp(&right.score)
-                    .unwrap_or(Ordering::Equal)
-            });
-            candidates.first().copied()
+            if random_server {
+                candidates.choose(&mut rand::rng()).copied()
+            } else {
+                candidates.sort_by(|left, right| {
+                    left.score
+                        .partial_cmp(&right.score)
+                        .unwrap_or(Ordering::Equal)
+                });
+                candidates.first().copied()
+            }
         }
         .ok_or_else(|| {
             NativeError::new(
@@ -473,6 +515,84 @@ fn string(params: &Value, key: &str) -> String {
         .unwrap_or("")
         .trim()
         .to_owned()
+}
+
+pub(crate) fn normalize_search(value: &str) -> String {
+    value
+        .trim()
+        .nfd()
+        .filter(|character| !is_combining_mark(*character))
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+pub(crate) fn compact_server_name(value: &str) -> String {
+    normalize_search(value)
+        .chars()
+        .filter(|character| !matches!(character, '#' | '-') && !character.is_whitespace())
+        .collect()
+}
+
+pub(crate) fn canonical_server_lookup_query(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty()
+        || trimmed.len() > 128
+        || !trimmed
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '#' | '-'))
+    {
+        return None;
+    }
+    let mut canonical = trimmed.to_ascii_uppercase();
+    let digit_index = canonical.find(|character: char| character.is_ascii_digit())?;
+    let prefix = &canonical[..digit_index];
+    if prefix
+        .chars()
+        .filter(|character| character.is_ascii_alphabetic())
+        .count()
+        < 2
+        || !prefix
+            .chars()
+            .all(|character| character.is_ascii_alphabetic() || matches!(character, '#' | '-'))
+    {
+        return None;
+    }
+    if !prefix.contains('#') {
+        if prefix.ends_with('-') {
+            canonical.replace_range(digit_index - 1..digit_index, "#");
+        } else {
+            canonical.insert(digit_index, '#');
+        }
+    }
+    Some(canonical)
+}
+
+fn server_name_match_rank(name: &str, query: &str, compact_query: &str) -> Option<u8> {
+    if query.is_empty() {
+        return Some(0);
+    }
+    let normalized_name = normalize_search(name);
+    let compact_name = compact_server_name(&normalized_name);
+    if normalized_name == query || (!compact_query.is_empty() && compact_name == compact_query) {
+        return Some(0);
+    }
+    if normalized_name.starts_with(query)
+        || (!compact_query.is_empty() && compact_name.starts_with(compact_query))
+    {
+        return Some(1);
+    }
+    normalized_name
+        .match_indices(query)
+        .any(|(index, _)| {
+            index == 0
+                || normalized_name[..index]
+                    .chars()
+                    .next_back()
+                    .is_some_and(|character| {
+                        character.is_whitespace() || matches!(character, '#' | '-')
+                    })
+        })
+        .then_some(2)
 }
 
 fn object_string(params: &serde_json::Map<String, Value>, key: &str) -> String {
@@ -598,7 +718,7 @@ mod tests {
             ],
             extra: Default::default(),
         };
-        let selected = catalog.select(&json!({"target": {}}), 0, &[]).unwrap();
+        let selected = catalog.select(&json!({"target": {}}), 0, &[], "").unwrap();
         assert_eq!(selected.logical.name, "Standard");
     }
 
@@ -622,11 +742,11 @@ mod tests {
             city: String::new(),
         }];
         let selected = catalog
-            .select(&json!({"target": {}}), 1, &excluded)
+            .select(&json!({"target": {}}), 1, &excluded, "")
             .unwrap();
         assert_eq!(selected.logical.name, "CH");
         let explicit = catalog
-            .select(&json!({"target": {"country_code": "US"}}), 1, &excluded)
+            .select(&json!({"target": {"country_code": "US"}}), 1, &excluded, "")
             .unwrap();
         assert_eq!(explicit.logical.name, "US");
     }
@@ -649,7 +769,7 @@ mod tests {
 
         for _ in 0..64 {
             let selected = catalog
-                .select(&json!({"target": {"random": true}}), 1, &[])
+                .select(&json!({"target": {"random": true}}), 1, &[], "")
                 .unwrap();
             assert!(matches!(
                 selected.logical.name.as_str(),
@@ -683,14 +803,72 @@ mod tests {
                 }}),
                 1,
                 &[],
+                "",
             )
             .unwrap();
         assert_eq!(selected.logical.name, "SC-via-CH");
 
         let error = catalog
-            .select(&json!({"target": {"entry_country_code": "CH"}}), 1, &[])
+            .select(&json!({"target": {"entry_country_code": "CH"}}), 1, &[], "")
             .unwrap_err();
         assert_eq!(error.code, "invalid_params");
+    }
+
+    #[test]
+    fn automatic_selection_can_exclude_the_device_country() {
+        let mut mx = logical("MX-best", "MX", 0, 0.01);
+        mx.tier = 1;
+        let mut us = logical("US-best", "US", 0, 0.50);
+        us.tier = 1;
+        let catalog = ServerCatalog {
+            expiration_time: 0.0,
+            loads_expiration_time: 0.0,
+            max_tier: 1,
+            logical_servers: vec![mx, us],
+            extra: Default::default(),
+        };
+
+        let selected = catalog
+            .select(
+                &json!({"target": {"exclude_my_country": true}}),
+                1,
+                &[],
+                "MX",
+            )
+            .unwrap();
+        assert_eq!(selected.logical.name, "US-best");
+    }
+
+    #[test]
+    fn random_server_is_scoped_after_location_filters() {
+        let mut mx_one = logical("MX#1", "MX", 0, 0.01);
+        mx_one.tier = 1;
+        let mut mx_two = logical("MX#2", "MX", 0, 0.99);
+        mx_two.tier = 1;
+        let mut us = logical("US#1", "US", 0, 0.01);
+        us.tier = 1;
+        let catalog = ServerCatalog {
+            expiration_time: 0.0,
+            loads_expiration_time: 0.0,
+            max_tier: 1,
+            logical_servers: vec![mx_one, mx_two, us],
+            extra: Default::default(),
+        };
+
+        for _ in 0..32 {
+            let selected = catalog
+                .select(
+                    &json!({"target": {
+                        "country_code": "MX",
+                        "random_server": true
+                    }}),
+                    1,
+                    &[],
+                    "",
+                )
+                .unwrap();
+            assert!(matches!(selected.logical.name.as_str(), "MX#1" | "MX#2"));
+        }
     }
 
     #[test]
@@ -715,5 +893,68 @@ mod tests {
         assert_eq!(country["states"][0]["cities"][0], "Los Angeles");
         assert_eq!(country["p2p_states"][0]["name"], "New York");
         assert_eq!(country["p2p_states"][0]["cities"][0], "New York");
+    }
+
+    #[test]
+    fn server_search_normalizes_accents_and_common_name_variants() {
+        assert_eq!(normalize_search("  México  "), "mexico");
+        assert_eq!(compact_server_name("US-FREE#42"), "usfree42");
+        assert_eq!(server_name_match_rank("US#42", "us42", "us42"), Some(0));
+        assert_eq!(
+            server_name_match_rank("US-FREE#42", "free", "free"),
+            Some(2)
+        );
+        assert_eq!(
+            canonical_server_lookup_query("us42").as_deref(),
+            Some("US#42")
+        );
+        assert_eq!(
+            canonical_server_lookup_query("ch-us#12-a").as_deref(),
+            Some("CH-US#12-A")
+        );
+        assert_eq!(
+            canonical_server_lookup_query("us-ca-42").as_deref(),
+            Some("US-CA#42")
+        );
+        assert_eq!(canonical_server_lookup_query("Mexico"), None);
+    }
+
+    #[test]
+    fn server_search_does_not_turn_a_country_query_into_server_results() {
+        let catalog = ServerCatalog {
+            expiration_time: 0.0,
+            loads_expiration_time: 0.0,
+            max_tier: 0,
+            logical_servers: vec![logical("MX#1", "MX", 0, 0.1)],
+            extra: Default::default(),
+        };
+        let result = catalog
+            .servers_page(&json!({ "query": "Mexico", "feature": "standard" }), 0)
+            .unwrap();
+        assert_eq!(result["total"], 0);
+    }
+
+    #[test]
+    fn server_search_scopes_gateways_away_from_consumer_servers() {
+        let consumer = logical("US#1", "US", 0, 0.1);
+        let mut gateway = logical("ACME#1", "US", 0, 0.2);
+        gateway.gateway_name = "ACME".into();
+        let catalog = ServerCatalog {
+            expiration_time: 0.0,
+            loads_expiration_time: 0.0,
+            max_tier: 0,
+            logical_servers: vec![consumer, gateway],
+            extra: Default::default(),
+        };
+
+        let consumer_result = catalog
+            .servers_page(&json!({ "query": "", "scope": "consumer" }), 0)
+            .unwrap();
+        let gateway_result = catalog
+            .servers_page(&json!({ "query": "", "scope": "gateways" }), 0)
+            .unwrap();
+        assert_eq!(consumer_result["total"], 1);
+        assert_eq!(gateway_result["total"], 1);
+        assert_eq!(gateway_result["servers"][0]["name"], "ACME#1");
     }
 }

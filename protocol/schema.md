@@ -68,20 +68,21 @@ duplicate support submissions conflict. Store writes are atomic and independent 
 Cached/read requests do not wait behind long mutations; authenticated reads receive an immediate
 conflict while the shared session itself is changing.
 
+`servers.get` accepts the bounded pagination fields `offset` and `limit`, plus `query`,
+`country_code`, `gateway_name`, `feature`, and `scope`. Search queries match server names rather
+than expanding a country or city into every server at that location. `scope` is `consumer`,
+`gateways`, or `all`, so a gateway search cannot leak into the consumer catalog.
+`servers.lookup` accepts a complete server-name query and is intended for a delayed exact lookup
+after local results are empty; successful remote results are retained in the in-memory catalog so
+the selected server can be connected without a second fetch.
+
 ## Authentication and security keys
 
-Credentialless guest login uses the same public contract as Proton's Android client:
-
-```json
-{"v":1,"id":"19","type":"request","method":"account.login_guest","params":{}}
-```
-
-The agent calls Proton's `/auth/v4/credentialless` endpoint, then runs the normal VPN bootstrap,
-certificate and server-catalog flow. The resulting Free-tier session is stored in Secret Service
-and survives agent and system restarts. `account.credentialless=true` distinguishes it from a
-regular account without exposing its internal storage identity. Guest mode does not relax Free
-plan restrictions. Account web hand-off opens the Proton signup page instead of attempting a
-session fork.
+Credentialless guest login is not advertised on Linux. Proton's production API currently limits
+that flow to Android and iOS device challenges; exposing an unusable method would make capability
+negotiation dishonest. `account.credentialless` remains in snapshots for forward compatibility
+and for reading any already-persisted session that may carry the flag. Account web hand-off opens
+the Proton signup page instead of attempting a session fork.
 
 Credential login and authenticator-code 2FA use the official `ProtonVPNAPI.login()` and
 `submit_2fa_code()` paths. `account.two_factor_code_supported` and
@@ -124,7 +125,7 @@ small bounded summary is pushed in every state snapshot:
     "revision": 4,
     "ready": true,
     "onboarding_complete": true,
-    "locale": "es-MX",
+    "locale": "en",
     "start_with_omarchy": true,
     "auto_connect": false,
     "account_scope_known": true,
@@ -182,10 +183,15 @@ The backend state therefore separates these facts instead of exposing a single `
   },
   "connection": {
     "observation_known": false,
-    "status": "unknown"
+    "status": "unknown",
+    "profile_id": null
   }
 }
 ```
+
+When a stored profile created the observed tunnel, `connection.profile_id` is its exact store
+identifier. It is persisted as private metadata on the unsaved NetworkManager connection, so the
+association survives GUI or agent restarts without inferring identity from server settings.
 
 `connector_initialized=false` is the expected **agent-only** idle-startup state. `status=unknown`
 is not an alias for `disconnected`. After a signed-in GUI requests `connection.observe`, the
@@ -408,6 +414,14 @@ P2P may be combined with State/City and keeps the same location filters. Tor, Se
 gateway modes cannot be combined with State/City because the frozen Windows Search does not
 create those location-item combinations. `state` is read from the immutable `State` field in
 the Proton logical-server payload and is carried read-only through the agent snapshot.
+
+Profiles keep their location hierarchy separate from their selection strategy. A target with
+`random=true` chooses an eligible country uniformly and then that country's best logical server,
+matching Windows' Random country behavior. `random_server=true` instead chooses a logical server
+after explicit country/state/city/gateway filters have been applied. `exclude_my_country=true`
+removes the country reported by Proton for the current physical connection from automatic
+selection; the request fails retryably if that device location is unavailable. Country-random
+and server-random cannot be combined in one request.
 
 ## Profile connection settings
 

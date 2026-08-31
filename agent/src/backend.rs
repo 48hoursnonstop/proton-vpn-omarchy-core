@@ -15,7 +15,6 @@ const NATIVE_METHODS: &[&str] = &[
     "report_issue.submit",
     "diagnostics.get",
     "account.login",
-    "account.login_guest",
     "account.submit_2fa",
     "account.authenticate_fido2",
     "account.submit_fido2_pin",
@@ -23,6 +22,7 @@ const NATIVE_METHODS: &[&str] = &[
     "account.logout",
     "locations.get",
     "servers.get",
+    "servers.lookup",
     "feature.set",
     "protocol.set",
     "dns.set",
@@ -47,7 +47,6 @@ const NATIVE_CAPABILITIES: &[&str] = &[
     "device_location.read",
     "account.session",
     "account.login",
-    "account.credentialless",
     "account.sso",
     "account.human_verification",
     "account.2fa",
@@ -58,6 +57,7 @@ const NATIVE_CAPABILITIES: &[&str] = &[
     "report_issue.categories",
     "report_issue.submit",
     "servers.page",
+    "servers.remote_lookup",
     "connection.observe",
     "connection.fastest",
     "connection.country",
@@ -248,8 +248,8 @@ mod tests {
         assert_eq!(native.name(), "proton_rust");
         assert!(native.methods().contains(&"connection.connect"));
         assert!(native.methods().contains(&"account.upgrade_url"));
-        assert!(native.methods().contains(&"account.login_guest"));
-        assert!(native.capabilities().contains(&"account.credentialless"));
+        assert!(!native.methods().contains(&"account.login_guest"));
+        assert!(!native.capabilities().contains(&"account.credentialless"));
         assert!(native.capabilities().contains(&"feature.netshield"));
         assert!(native.methods().contains(&"account.authenticate_fido2"));
         assert!(native

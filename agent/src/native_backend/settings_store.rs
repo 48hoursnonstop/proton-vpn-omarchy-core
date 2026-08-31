@@ -10,14 +10,21 @@ use std::{
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 pub fn save(path: &Path, settings: &NativeSettings) -> NativeResult<()> {
-    save_serialized(path, settings)
+    save_serialized(path, settings, true)
 }
 
 pub fn save_value(path: &Path, value: &serde_json::Value) -> NativeResult<()> {
-    save_serialized(path, value)
+    // API caches can be large. Compact JSON keeps their on-disk size close to
+    // the bounded response size instead of spending most of the cache budget
+    // on pretty-printing whitespace.
+    save_serialized(path, value, false)
 }
 
-fn save_serialized<T: serde::Serialize>(path: &Path, settings: &T) -> NativeResult<()> {
+fn save_serialized<T: serde::Serialize>(
+    path: &Path,
+    settings: &T,
+    pretty: bool,
+) -> NativeResult<()> {
     let parent = path.parent().ok_or_else(|| {
         NativeError::new(
             "settings_path_invalid",
@@ -26,7 +33,12 @@ fn save_serialized<T: serde::Serialize>(path: &Path, settings: &T) -> NativeResu
     })?;
     fs::create_dir_all(parent).map_err(|error| settings_error("create", path, error))?;
 
-    let bytes = serde_json::to_vec_pretty(settings).map_err(|error| {
+    let bytes = if pretty {
+        serde_json::to_vec_pretty(settings)
+    } else {
+        serde_json::to_vec(settings)
+    }
+    .map_err(|error| {
         NativeError::new("settings_invalid", "Unable to serialize Proton settings")
             .with_source(error)
     })?;
@@ -118,6 +130,26 @@ mod tests {
         assert_eq!(
             fs::metadata(&path).expect("metadata").permissions().mode() & 0o777,
             0o600
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn api_values_are_saved_compactly() {
+        let root = std::env::temp_dir().join(format!(
+            "proton-omarchy-cache-format-test-{}-{}",
+            std::process::id(),
+            TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let path = root.join("serverlist.json");
+        save_value(
+            &path,
+            &serde_json::json!({"LogicalServers": [{"ID": "one"}]}),
+        )
+        .expect("save compact value");
+        assert_eq!(
+            fs::read_to_string(&path).expect("read compact value"),
+            "{\"LogicalServers\":[{\"ID\":\"one\"}]}\n"
         );
         fs::remove_dir_all(root).expect("cleanup");
     }

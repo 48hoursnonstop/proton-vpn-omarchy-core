@@ -46,6 +46,7 @@ const OPENVPN_SERVICE: &str = "org.freedesktop.NetworkManager.openvpn";
 const PROTUN_INTERFACE: &str = "proton0";
 const PROTON_OMARCHY_OWNER_KEY: &str = "proton-omarchy-owner";
 const PROTON_OMARCHY_OWNER_VALUE: &str = "rust-v2";
+const PROTON_OMARCHY_PROFILE_ID_KEY: &str = "proton-omarchy-profile-id";
 const PROTON_OMARCHY_STABLE_ID: &str = "proton-omarchy-rust-v2";
 const IPV6_LEAK_CONNECTION_ID: &str = "pvpn-killswitch-ipv6";
 const IPV6_LEAK_INTERFACE: &str = "ipv6leakintrf0";
@@ -81,6 +82,7 @@ pub struct TunnelObservation {
     pub uuid: Option<String>,
     pub protocol: Option<String>,
     pub endpoint: Option<String>,
+    pub profile_id: Option<String>,
     pub owned: bool,
 }
 
@@ -96,6 +98,7 @@ pub(super) struct ProtunProfile {
     pub id: String,
     pub uuid: String,
     pub protocol: String,
+    pub profile_id: Option<String>,
     pub settings_json: String,
     pub private_key: Zeroizing<String>,
     pub enable_ipv6: bool,
@@ -108,6 +111,7 @@ pub(super) struct OpenVpnProfile {
     id: String,
     uuid: String,
     protocol: String,
+    profile_id: Option<String>,
     remote: String,
     domain: String,
     passphrase: Zeroizing<String>,
@@ -134,14 +138,27 @@ impl VpnProfile {
         session: &SessionData,
         client_config: &ClientConfig,
         settings: &NativeSettings,
+        profile_id: Option<String>,
     ) -> NativeResult<Self> {
         match normalize_protocol(protocol).as_str() {
-            "openvpn-udp" | "openvpn-tcp" => {
-                OpenVpnProfile::new(target, protocol, session, client_config, settings)
-                    .map(Self::OpenVpn)
-            }
-            _ => ProtunProfile::new(target, protocol, session, client_config, settings)
-                .map(Self::Protun),
+            "openvpn-udp" | "openvpn-tcp" => OpenVpnProfile::new(
+                target,
+                protocol,
+                session,
+                client_config,
+                settings,
+                profile_id,
+            )
+            .map(Self::OpenVpn),
+            _ => ProtunProfile::new(
+                target,
+                protocol,
+                session,
+                client_config,
+                settings,
+                profile_id,
+            )
+            .map(Self::Protun),
         }
     }
 
@@ -166,6 +183,13 @@ impl VpnProfile {
         }
     }
 
+    pub fn profile_id(&self) -> Option<&str> {
+        match self {
+            Self::Protun(profile) => profile.profile_id.as_deref(),
+            Self::OpenVpn(profile) => profile.profile_id.as_deref(),
+        }
+    }
+
     fn dbus_settings(&self) -> HashMap<&str, PropMap> {
         match self {
             Self::Protun(profile) => profile.dbus_settings(),
@@ -187,6 +211,7 @@ impl ProtunProfile {
         session: &SessionData,
         client_config: &ClientConfig,
         settings: &NativeSettings,
+        profile_id: Option<String>,
     ) -> NativeResult<Self> {
         let (udp_ports, tcp_ports, tls_ports) = match protocol {
             "protun-smart" | "smart" => (
@@ -250,6 +275,7 @@ impl ProtunProfile {
             id: format!("ProtonVPN {}", target.logical.name),
             uuid: Uuid::new_v4().to_string(),
             protocol: normalize_protocol(protocol),
+            profile_id,
             settings_json,
             private_key: Zeroizing::new(private_key),
             enable_ipv6: settings.ipv6 && target.logical.features & FEATURE_IPV6 != 0,
@@ -315,18 +341,18 @@ impl ProtunProfile {
 
         let mut vpn = PropMap::new();
         prop(&mut vpn, "service-type", PROTUN_SERVICE.to_owned());
-        prop(
-            &mut vpn,
-            "data",
-            HashMap::from([
-                ("settings".to_owned(), self.settings_json.clone()),
-                ("private-key-flags".to_owned(), "0".to_owned()),
-                (
-                    PROTON_OMARCHY_OWNER_KEY.to_owned(),
-                    PROTON_OMARCHY_OWNER_VALUE.to_owned(),
-                ),
-            ]),
-        );
+        let mut data = HashMap::from([
+            ("settings".to_owned(), self.settings_json.clone()),
+            ("private-key-flags".to_owned(), "0".to_owned()),
+            (
+                PROTON_OMARCHY_OWNER_KEY.to_owned(),
+                PROTON_OMARCHY_OWNER_VALUE.to_owned(),
+            ),
+        ]);
+        if let Some(profile_id) = &self.profile_id {
+            data.insert(PROTON_OMARCHY_PROFILE_ID_KEY.to_owned(), profile_id.clone());
+        }
+        prop(&mut vpn, "data", data);
         prop(
             &mut vpn,
             "secrets",
@@ -350,6 +376,7 @@ impl OpenVpnProfile {
         session: &SessionData,
         client_config: &ClientConfig,
         settings: &NativeSettings,
+        profile_id: Option<String>,
     ) -> NativeResult<Self> {
         let protocol = normalize_protocol(protocol);
         let ports = match protocol.as_str() {
@@ -427,6 +454,7 @@ impl OpenVpnProfile {
             id: format!("ProtonVPN {}", target.logical.name),
             uuid,
             protocol,
+            profile_id,
             remote,
             domain: target.logical.domain.clone(),
             passphrase,
@@ -483,7 +511,6 @@ impl OpenVpnProfile {
         } else {
             prop(&mut ipv6, "method", "disabled".to_owned());
         }
-
         let mut data = HashMap::from([
             ("ca".to_owned(), path_text(&self.ca)),
             ("cert".to_owned(), path_text(&self.certificate)),
@@ -511,6 +538,9 @@ impl OpenVpnProfile {
         if self.enable_ipv6 {
             data.insert("push-peer-info".to_owned(), "yes".to_owned());
             data.insert("tun-ipv6".to_owned(), "yes".to_owned());
+        }
+        if let Some(profile_id) = &self.profile_id {
+            data.insert(PROTON_OMARCHY_PROFILE_ID_KEY.to_owned(), profile_id.clone());
         }
 
         let mut vpn = PropMap::new();
@@ -814,6 +844,7 @@ impl NetworkManagerBackend {
                 VPN_STATE_FAILED => TunnelState::Error,
                 _ => TunnelState::Disconnected,
             };
+            let owned = profile_owned(&settings);
             return Ok(TunnelObservation {
                 state,
                 active_path: Some(active_path.to_string()),
@@ -822,7 +853,8 @@ impl NetworkManagerBackend {
                 uuid: active.uuid().ok(),
                 protocol: profile_protocol(&settings),
                 endpoint: profile_endpoint(&settings),
-                owned: profile_owned(&settings),
+                profile_id: owned.then(|| profile_store_id(&settings)).flatten(),
+                owned,
             });
         }
 
@@ -834,6 +866,7 @@ impl NetworkManagerBackend {
             uuid: None,
             protocol: None,
             endpoint: None,
+            profile_id: None,
             owned: false,
         })
     }
@@ -875,6 +908,7 @@ impl NetworkManagerBackend {
             uuid: Some(profile.uuid().to_owned()),
             protocol: Some(profile.protocol().to_owned()),
             endpoint: None,
+            profile_id: profile.profile_id().map(str::to_owned),
             owned: true,
         })
     }
@@ -1458,6 +1492,12 @@ fn vpn_data_string(settings: &HashMap<String, PropMap>, key: &str) -> Option<Str
     dict_string(&*data.0, key)
 }
 
+fn profile_store_id(settings: &HashMap<String, PropMap>) -> Option<String> {
+    vpn_data_string(settings, PROTON_OMARCHY_PROFILE_ID_KEY).filter(|value| {
+        !value.is_empty() && value.len() <= 128 && !value.chars().any(char::is_control)
+    })
+}
+
 fn profile_owned(settings: &HashMap<String, PropMap>) -> bool {
     settings
         .get("vpn")
@@ -1859,6 +1899,7 @@ mod tests {
             id: "ProtonVPN MX#1".into(),
             uuid: "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee".into(),
             protocol: "openvpn-tcp".into(),
+            profile_id: Some("profile-work".into()),
             remote: "192.0.2.1:443, 192.0.2.1:8443".into(),
             domain: "node.example.test".into(),
             passphrase: Zeroizing::new("test-only-passphrase".into()),
@@ -1879,6 +1920,7 @@ mod tests {
         assert_eq!(service_type(&settings).as_deref(), Some(OPENVPN_SERVICE));
         assert_eq!(profile_protocol(&settings).as_deref(), Some("openvpn-tcp"));
         assert_eq!(profile_endpoint(&settings).as_deref(), Some("192.0.2.1"));
+        assert_eq!(profile_store_id(&settings).as_deref(), Some("profile-work"));
         for key in [
             "ca",
             "cert",
