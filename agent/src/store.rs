@@ -32,6 +32,7 @@ const OFFICIAL_DEFAULT_PROFILE_IDS: [&str; 6] = [
     "proton-default-work-school-v1",
     "proton-default-random-v1",
 ];
+const FASTEST_DEFAULT_PROFILE_ID: &str = "proton-default-fastest-v1";
 
 fn fastest_default_connection() -> Value {
     json!({ "type": "fastest" })
@@ -91,6 +92,7 @@ struct MigrationState {
     legacy_qt_store_imported: bool,
     copied_to_account_keys: Vec<String>,
     official_default_profiles_seeded_for_accounts: Vec<String>,
+    fastest_default_profile_seeded_for_accounts: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -161,6 +163,8 @@ impl StoreHandle {
         };
         let default_profiles_seeded = seed_known_accounts_with_official_profiles(&mut data)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.message))?;
+        let fastest_profile_seeded = seed_known_accounts_with_fastest_profile(&mut data)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.message))?;
         let default_connections_repaired = repair_default_connections(&mut data);
 
         let handle = Self {
@@ -173,7 +177,12 @@ impl StoreHandle {
             operations,
         };
 
-        if !existed || migrated || default_profiles_seeded || default_connections_repaired {
+        if !existed
+            || migrated
+            || default_profiles_seeded
+            || fastest_profile_seeded
+            || default_connections_repaired
+        {
             let inner = handle.lock();
             save_store(&inner.path, &inner.data)?;
         }
@@ -229,6 +238,7 @@ impl StoreHandle {
             }
         }
         seed_account_with_official_profiles(&mut inner.data, &account_key)?;
+        seed_account_with_fastest_profile(&mut inner.data, &account_key)?;
         inner.data.active_account_key = Some(account_key);
         inner.data.revision = inner.data.revision.wrapping_add(1);
         if let Err(error) = save_store(&inner.path, &inner.data) {
@@ -1790,6 +1800,82 @@ fn seed_known_accounts_with_official_profiles(data: &mut StoreFile) -> Result<bo
     Ok(changed)
 }
 
+fn seed_known_accounts_with_fastest_profile(data: &mut StoreFile) -> Result<bool, BackendError> {
+    let account_keys = data.accounts.keys().cloned().collect::<Vec<_>>();
+    let mut changed = false;
+    for account_key in account_keys {
+        changed |= seed_account_with_fastest_profile(data, &account_key)?;
+    }
+    Ok(changed)
+}
+
+fn seed_account_with_fastest_profile(
+    data: &mut StoreFile,
+    account_key: &str,
+) -> Result<bool, BackendError> {
+    if data
+        .migration
+        .fastest_default_profile_seeded_for_accounts
+        .iter()
+        .any(|key| key == account_key)
+    {
+        return Ok(false);
+    }
+
+    let profile = fastest_default_profile(&data.onboarding.locale)?;
+    let account = data.accounts.entry(account_key.into()).or_default();
+    let already_exists = account.profiles.iter().any(|existing| {
+        existing.get("id").and_then(Value::as_str) == Some(FASTEST_DEFAULT_PROFILE_ID)
+    });
+    let mut changed = false;
+    if !already_exists && account.profiles.len() < MAX_PROFILES {
+        account.profiles.insert(0, profile);
+        changed = true;
+    }
+
+    let complete = account.profiles.iter().any(|existing| {
+        existing.get("id").and_then(Value::as_str) == Some(FASTEST_DEFAULT_PROFILE_ID)
+    });
+    if complete {
+        if account
+            .default_connection
+            .get("type")
+            .and_then(Value::as_str)
+            == Some("fastest")
+        {
+            account.default_connection = json!({
+                "type": "profile",
+                "profileId": FASTEST_DEFAULT_PROFILE_ID
+            });
+        }
+        data.migration
+            .fastest_default_profile_seeded_for_accounts
+            .push(account_key.into());
+        changed = true;
+    }
+    Ok(changed)
+}
+
+fn fastest_default_profile(locale: &str) -> Result<Value, BackendError> {
+    let spanish = locale
+        .replace('_', "-")
+        .split('-')
+        .next()
+        .is_some_and(|language| language.eq_ignore_ascii_case("es"));
+    let raw = json!({
+        "name": if spanish { "Servidor más rápido" } else { "Fastest server" },
+        "targetKind": "fastest",
+        "iconName": "Speed"
+    });
+    let object = raw.as_object().ok_or_else(|| {
+        BackendError::new(
+            "default_profile_invalid",
+            "The fastest default profile template is invalid",
+        )
+    })?;
+    normalize_profile(object, None, FASTEST_DEFAULT_PROFILE_ID).map(Value::Object)
+}
+
 fn seed_account_with_official_profiles(
     data: &mut StoreFile,
     account_key: &str,
@@ -2290,6 +2376,59 @@ mod tests {
         let resolved = resolved_profile(&account.profiles[5], "profile")
             .expect("resolve random default profile");
         assert_eq!(resolved["connect_params"]["target"]["random"], true);
+    }
+
+    #[test]
+    fn fastest_profile_is_seeded_and_becomes_the_initial_default() {
+        let mut data = StoreFile::default();
+        data.onboarding.locale = "es-MX".into();
+        data.accounts
+            .insert("account-test".into(), AccountStore::default());
+
+        assert!(seed_account_with_fastest_profile(&mut data, "account-test")
+            .expect("seed fastest profile"));
+        let account = data.accounts.get("account-test").unwrap();
+        assert_eq!(account.profiles.len(), 1);
+        assert_eq!(account.profiles[0]["id"], FASTEST_DEFAULT_PROFILE_ID);
+        assert_eq!(account.profiles[0]["name"], "Servidor más rápido");
+        assert_eq!(account.profiles[0]["targetKind"], "fastest");
+        assert_eq!(
+            account.default_connection,
+            json!({
+                "type": "profile",
+                "profileId": FASTEST_DEFAULT_PROFILE_ID
+            })
+        );
+
+        let resolved = resolve_connection(account, &json!({}))
+            .expect("resolve fastest profile as the default");
+        assert_eq!(resolved["connect_params"]["target"], json!({}));
+        assert_eq!(
+            resolved["connect_params"]["profile_id"],
+            FASTEST_DEFAULT_PROFILE_ID
+        );
+        assert!(
+            !seed_account_with_fastest_profile(&mut data, "account-test")
+                .expect("do not seed fastest profile twice")
+        );
+    }
+
+    #[test]
+    fn fastest_profile_migration_preserves_an_explicit_default() {
+        let mut data = StoreFile::default();
+        data.accounts.insert(
+            "account-test".into(),
+            AccountStore {
+                default_connection: json!({ "type": "random" }),
+                ..AccountStore::default()
+            },
+        );
+
+        seed_account_with_fastest_profile(&mut data, "account-test").expect("seed fastest profile");
+        assert_eq!(
+            data.accounts["account-test"].default_connection,
+            json!({ "type": "random" })
+        );
     }
 
     #[test]

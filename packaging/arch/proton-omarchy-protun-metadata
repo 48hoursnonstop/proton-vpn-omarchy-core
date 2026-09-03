@@ -17,16 +17,18 @@ grep -Fxq 'program=/usr/libexec/nm-protun-service' "$descriptor" || {
   printf 'proton-omarchy-protun-metadata: refusing unknown ProTun program\n' >&2
   exit 1
 }
-grep -Fxq 'supports-safe-private-file-access=true' "$descriptor" && exit 0
-
 temporary=$(mktemp "${descriptor}.XXXXXX")
 trap 'rm -f "$temporary"' EXIT
 awk '
   BEGIN { in_vpn = 0; inserted = 0 }
-  /^\[VPN Connection\]$/ { in_vpn = 1 }
-  in_vpn && /^supports-safe-private-file-access=/ {
-    if (!inserted) print "supports-safe-private-file-access=true"
-    inserted = 1
+  /^supports-safe-private-file-access=/ {
+    # Drop both legacy misplaced keys and an existing in-section value. A
+    # single canonical value is inserted below.
+    next
+  }
+  /^\[VPN Connection\]$/ {
+    in_vpn = 1
+    print
     next
   }
   in_vpn && /^supports-multiple-connections=/ {
@@ -35,10 +37,12 @@ awk '
     inserted = 1
     next
   }
-  in_vpn && /^\[/ {
-    if (!inserted) print "supports-safe-private-file-access=true"
-    inserted = 1
+  /^\[/ {
+    if (in_vpn && !inserted) print "supports-safe-private-file-access=true"
+    if (in_vpn) inserted = 1
     in_vpn = 0
+    print
+    next
   }
   { print }
   END {
@@ -46,12 +50,23 @@ awk '
   }
 ' "$descriptor" >"$temporary"
 
-grep -Fxq 'supports-safe-private-file-access=true' "$temporary" || {
+awk '
+  /^\[VPN Connection\]$/ { in_vpn = 1; next }
+  /^\[/ { in_vpn = 0 }
+  in_vpn && /^supports-safe-private-file-access=true$/ { found++ }
+  END { exit found == 1 ? 0 : 1 }
+' "$temporary" || {
   printf 'proton-omarchy-protun-metadata: failed to update descriptor\n' >&2
   exit 1
 }
-install -m 0644 "$temporary" "$descriptor"
+if ! cmp -s "$temporary" "$descriptor"; then
+  install -m 0644 "$temporary" "$descriptor"
+fi
 
-if systemctl is-active --quiet NetworkManager.service 2>/dev/null; then
-  systemctl reload NetworkManager.service || true
+if [[ ${PROTON_OMARCHY_PROTUN_SKIP_RELOAD:-0} != 1 ]] &&
+   systemctl is-active --quiet NetworkManager.service 2>/dev/null; then
+  # NetworkManager caches VPN plugin descriptors for the lifetime of the
+  # daemon. SIGHUP reloads its configuration but does not discover a ProTun
+  # descriptor installed in the same package transaction.
+  systemctl restart NetworkManager.service || true
 fi

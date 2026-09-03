@@ -56,7 +56,7 @@ recipe and uses the tracked `packaging/release/SOURCE_DATE_EPOCH`.
 
 Use the guided, signature-verifying installer in the [Omarchy plugin][plugin].
 It installs the matching package and configures systemd socket activation.
-Manual package downloads remain available from the [0.9.2 release][release].
+Manual package downloads remain available from the [0.9.3 release][release].
 
 ## Security and license
 
@@ -68,4 +68,4 @@ Original project code is GPL-3.0-or-later. Vendored and upstream-derived files
 retain their own notices and license files; see `NOTICE.md`.
 
 [plugin]: https://github.com/48hoursnonstop/proton-vpn-omarchy
-[release]: https://github.com/48hoursnonstop/proton-vpn-omarchy-core/releases/tag/v0.9.2
+[release]: https://github.com/48hoursnonstop/proton-vpn-omarchy-core/releases/tag/v0.9.3

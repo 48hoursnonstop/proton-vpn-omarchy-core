@@ -17,7 +17,11 @@ post_upgrade() {
 
 pre_remove() {
   systemctl disable --now proton.VPN.service
-  echo ":: Before removing the core, its user services can be disabled with:"
-  echo "   proton-omarchy-setup uninstall"
-  echo ":: Pacman intentionally does not modify users' ~/.config directories."
+  rm -rf -- /var/lib/proton-vpn-omarchy
+  echo ":: Removed Proton VPN for Omarchy system services and system state."
+  echo ":: User state is removed by the plugin's clean-uninstall action."
+}
+
+post_remove() {
+  systemctl daemon-reload
 }
