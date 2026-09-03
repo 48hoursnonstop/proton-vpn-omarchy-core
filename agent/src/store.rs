@@ -33,6 +33,10 @@ const OFFICIAL_DEFAULT_PROFILE_IDS: [&str; 6] = [
     "proton-default-random-v1",
 ];
 
+fn fastest_default_connection() -> Value {
+    json!({ "type": "fastest" })
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 struct StoreFile {
@@ -105,7 +109,7 @@ impl Default for AccountStore {
             profiles: Vec::new(),
             recents: Vec::new(),
             excluded_locations: Vec::new(),
-            default_connection: json!({ "type": "fastest" }),
+            default_connection: fastest_default_connection(),
             ui_preferences: json!({}),
         }
     }
@@ -157,6 +161,7 @@ impl StoreHandle {
         };
         let default_profiles_seeded = seed_known_accounts_with_official_profiles(&mut data)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.message))?;
+        let default_connections_repaired = repair_default_connections(&mut data);
 
         let handle = Self {
             inner: Arc::new(Mutex::new(StoreInner {
@@ -168,7 +173,7 @@ impl StoreHandle {
             operations,
         };
 
-        if !existed || migrated || default_profiles_seeded {
+        if !existed || migrated || default_profiles_seeded || default_connections_repaired {
             let inner = handle.lock();
             save_store(&inner.path, &inner.data)?;
         }
@@ -744,7 +749,7 @@ fn resolve_connection(account: &AccountStore, params: &Value) -> BackendResult {
     match selection_type {
         "fastest" => Ok(json!({
             "selection": { "type": "fastest" },
-            "connect_params": {}
+            "connect_params": { "target": {} }
         })),
         "random" => Ok(json!({
             "selection": { "type": "random" },
@@ -755,7 +760,7 @@ fn resolve_connection(account: &AccountStore, params: &Value) -> BackendResult {
             None => Ok(json!({
                 "selection": { "type": "last" },
                 "fallback": "fastest",
-                "connect_params": {}
+                "connect_params": { "target": {} }
             })),
         },
         "recent" => {
@@ -1505,13 +1510,23 @@ fn normalize_default(
 }
 
 fn validate_default(account: &mut AccountStore) {
-    let Some(selection) = account.default_connection.as_object() else {
-        account.default_connection = json!({ "type": "fastest" });
-        return;
-    };
-    if normalize_default(selection, account).is_err() {
-        account.default_connection = json!({ "type": "fastest" });
+    let normalized = account
+        .default_connection
+        .as_object()
+        .cloned()
+        .and_then(|selection| normalize_default(&selection, account).ok())
+        .unwrap_or_else(fastest_default_connection);
+    account.default_connection = normalized;
+}
+
+fn repair_default_connections(data: &mut StoreFile) -> bool {
+    let mut changed = false;
+    for account in data.accounts.values_mut() {
+        let previous = account.default_connection.clone();
+        validate_default(account);
+        changed |= account.default_connection != previous;
     }
+    changed
 }
 
 fn import_legacy(path: &Path, data: &mut StoreFile) -> io::Result<bool> {
@@ -1556,7 +1571,7 @@ fn import_legacy(path: &Path, data: &mut StoreFile) -> io::Result<bool> {
     trim_recents(&mut account);
     if let Some(selection) = object.get("default_connection").and_then(Value::as_object) {
         account.default_connection =
-            normalize_default(selection, &account).unwrap_or_else(|_| json!({ "type": "fastest" }));
+            normalize_default(selection, &account).unwrap_or_else(|_| fastest_default_connection());
     }
     data.accounts.insert(LEGACY_SCOPE.into(), account);
     data.migration.legacy_qt_store_imported = true;
@@ -2184,6 +2199,66 @@ mod tests {
             .expect("read canonical preferences");
         assert_eq!(summary.get("start_with_omarchy"), Some(&Value::Bool(true)));
         assert_eq!(summary.get("auto_connect"), Some(&Value::Bool(true)));
+    }
+
+    #[test]
+    fn fastest_is_the_connectable_default_for_new_accounts() {
+        let account = AccountStore::default();
+        assert_eq!(account.default_connection, json!({ "type": "fastest" }));
+
+        let resolved = resolve_connection(&account, &json!({}))
+            .expect("resolve the default connection on a new account");
+        assert_eq!(resolved["selection"], json!({ "type": "fastest" }));
+        assert_eq!(resolved["connect_params"]["target"], json!({}));
+
+        let last = resolve_connection(&account, &json!({ "selection": { "type": "last" } }))
+            .expect("fall back to fastest before a first connection");
+        assert_eq!(last["fallback"], "fastest");
+        assert_eq!(last["connect_params"]["target"], json!({}));
+    }
+
+    #[test]
+    fn opening_the_store_repairs_and_persists_invalid_defaults() {
+        let tree = TestTree::new("repair-default");
+        let store_path = tree.0.join("data/state-v1.json");
+        let lifecycle_path = tree.0.join("config/proton-vpn-omarchy/lifecycle.json");
+        let legacy_path = tree.0.join("legacy.json");
+        let mut data = StoreFile {
+            active_account_key: Some("account-test".into()),
+            ..StoreFile::default()
+        };
+        data.accounts.insert(
+            "account-test".into(),
+            AccountStore {
+                default_connection: json!({}),
+                ..AccountStore::default()
+            },
+        );
+        save_store(&store_path, &data).expect("persist an older malformed default");
+
+        let (state_tx, _state_rx) = watch::channel(StateSnapshot::default());
+        let operations = OperationCoordinator::new(state_tx.clone());
+        let store = StoreHandle::open(
+            store_path.clone(),
+            &legacy_path,
+            lifecycle_path,
+            state_tx,
+            operations,
+        )
+        .expect("repair the canonical store");
+
+        let summary = store
+            .request("test-client", "store.get", json!({}))
+            .expect("read the repaired default");
+        assert_eq!(
+            summary.get("default_connection"),
+            Some(&json!({ "type": "fastest" }))
+        );
+        drop(store);
+        assert_eq!(
+            load_store(&store_path).unwrap().accounts["account-test"].default_connection,
+            json!({ "type": "fastest" })
+        );
     }
 
     #[test]
