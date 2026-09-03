@@ -35,7 +35,7 @@ impl SecretStore {
             if raw.len() > MAX_SESSION_BYTES {
                 continue;
             }
-            let Ok(session) = serde_json::from_str::<SessionData>(&raw) else {
+            let Some(session) = decode_session(&raw) else {
                 continue;
             };
             if session.account_name == account && session.is_authenticated() {
@@ -104,6 +104,44 @@ impl SecretStore {
     }
 }
 
+fn decode_session(raw: &str) -> Option<SessionData> {
+    if let Ok(session) = serde_json::from_str(raw) {
+        return Some(session);
+    }
+
+    // Omarchy's default passwordless GNOME Keyring stores secrets in a
+    // GKeyFile. gnome-keyring writes textual secrets with
+    // g_key_file_set_value(), but reads them with g_key_file_get_string().
+    // Consequently, JSON escapes such as `\n` in Proton's PEM material are
+    // returned as literal control characters after the daemon restarts. Our
+    // session format is compact JSON, so it contains no formatting control
+    // characters; escaping them again recovers only values changed by that
+    // round trip. Keep the recovered representation in memory rather than
+    // introducing a private storage envelope: these entries intentionally use
+    // Proton SSO's shared key names and JSON contract.
+    let repaired = escape_legacy_control_characters(raw);
+    serde_json::from_str(&repaired).ok()
+}
+
+fn escape_legacy_control_characters(raw: &str) -> String {
+    let mut repaired = String::with_capacity(raw.len());
+    for character in raw.chars() {
+        match character {
+            '\u{08}' => repaired.push_str("\\b"),
+            '\u{0c}' => repaired.push_str("\\f"),
+            '\n' => repaired.push_str("\\n"),
+            '\r' => repaired.push_str("\\r"),
+            '\t' => repaired.push_str("\\t"),
+            character if character <= '\u{1f}' => {
+                use std::fmt::Write;
+                let _ = write!(repaired, "\\u{:04x}", u32::from(character));
+            }
+            character => repaired.push(character),
+        }
+    }
+    repaired
+}
+
 fn valid_account_name(account_name: &str) -> bool {
     let trimmed = account_name.trim();
     !trimmed.is_empty()
@@ -133,7 +171,43 @@ fn keyring_error(action: &str, error: keyring::Error) -> NativeError {
 
 #[cfg(test)]
 mod tests {
-    use super::{account_key, valid_account_name, MAX_ACCOUNT_NAME_BYTES};
+    use super::{account_key, decode_session, valid_account_name, MAX_ACCOUNT_NAME_BYTES};
+    use crate::native_backend::models::{
+        SessionData, VpnCertificate, VpnLocation, VpnSecrets, VpnSessionData,
+    };
+    use serde_json::json;
+
+    fn session() -> SessionData {
+        SessionData {
+            uid: "uid".into(),
+            access_token: "access-token".into(),
+            refresh_token: "refresh-token".into(),
+            scopes: vec!["vpn".into()],
+            account_name: "test@example.test".into(),
+            credentialless: false,
+            environment: "prod".into(),
+            vpn: VpnSessionData {
+                vpninfo: json!({"VPN": {"MaxTier": 2}}),
+                certificate: VpnCertificate {
+                    certificate:
+                        "-----BEGIN CERTIFICATE-----\nRkFLRQ==\n-----END CERTIFICATE-----\n".into(),
+                    client_key: "-----BEGIN PUBLIC KEY-----\nRkFLRQ==\n-----END PUBLIC KEY-----\n"
+                        .into(),
+                    client_key_fingerprint: "fingerprint".into(),
+                    expiration_time: 2,
+                    refresh_time: 1,
+                    server_public_key: String::new(),
+                    server_public_key_mode: "EC".into(),
+                    extra: serde_json::Map::new(),
+                },
+                secrets: VpnSecrets {
+                    ed25519_privatekey: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into(),
+                },
+                location: VpnLocation::default(),
+            },
+            extra: serde_json::Map::new(),
+        }
+    }
 
     #[test]
     fn account_key_matches_proton_sso_base32_contract() {
@@ -146,5 +220,32 @@ mod tests {
         assert!(!valid_account_name("   "));
         assert!(!valid_account_name("bad\0name"));
         assert!(!valid_account_name(&"x".repeat(MAX_ACCOUNT_NAME_BYTES + 1)));
+    }
+
+    #[test]
+    fn proton_sso_json_session_remains_compatible() {
+        let raw = serde_json::to_string(&session()).expect("serialize session");
+        let decoded = decode_session(&raw).expect("decode session");
+        assert_eq!(decoded.account_name, "test@example.test");
+        assert!(decoded.vpn.certificate.certificate.contains("\nRkFLRQ==\n"));
+    }
+
+    #[test]
+    fn passwordless_gnome_keyring_round_trip_is_recovered() {
+        let raw = serde_json::to_string(&session()).expect("serialize session");
+        let damaged = raw.replace("\\n", "\n");
+        assert!(serde_json::from_str::<SessionData>(&damaged).is_err());
+
+        let decoded = decode_session(&damaged).expect("repair session");
+        assert_eq!(decoded.account_name, "test@example.test");
+        assert_eq!(
+            decoded.vpn.certificate.certificate,
+            session().vpn.certificate.certificate
+        );
+    }
+
+    #[test]
+    fn malformed_sessions_are_rejected() {
+        assert!(decode_session("not a session").is_none());
     }
 }

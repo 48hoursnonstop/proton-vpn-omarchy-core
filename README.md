@@ -56,7 +56,21 @@ recipe and uses the tracked `packaging/release/SOURCE_DATE_EPOCH`.
 
 Use the guided, signature-verifying installer in the [Omarchy plugin][plugin].
 It installs the matching package and configures systemd socket activation.
-Manual package downloads remain available from the [0.9.4 release][release].
+Manual package downloads remain available from the [0.9.5 release][release].
+
+## GNOME Keyring compatibility
+
+Omarchy's passwordless default GNOME Keyring stores secrets in a textual
+GKeyFile. GNOME Keyring can turn escaped control characters in Proton's JSON
+session—most visibly the newlines in PEM certificates—into literal characters
+after the daemon restarts. Starting with 0.9.5, the core repairs that specific
+round-trip transformation while reading the shared Proton SSO entry. The
+stored schema remains compatible with Proton's Linux components, and the core
+does not delete or recreate the user's keyring.
+
+If credentials from unrelated applications disappear, preserve
+`~/.local/share/keyrings` before troubleshooting; that indicates a broader
+keyring problem rather than cleanup performed by this package.
 
 ## Security and license
 
@@ -68,4 +82,4 @@ Original project code is GPL-3.0-or-later. Vendored and upstream-derived files
 retain their own notices and license files; see `NOTICE.md`.
 
 [plugin]: https://github.com/48hoursnonstop/proton-vpn-omarchy
-[release]: https://github.com/48hoursnonstop/proton-vpn-omarchy-core/releases/tag/v0.9.4
+[release]: https://github.com/48hoursnonstop/proton-vpn-omarchy-core/releases/tag/v0.9.5
