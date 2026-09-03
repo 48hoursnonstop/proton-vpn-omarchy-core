@@ -17,6 +17,8 @@ post_upgrade() {
 
 pre_remove() {
   systemctl disable --now proton.VPN.service
+  /usr/lib/proton-vpn-omarchy/proton-omarchy-protun-metadata --restore ||
+    echo ":: Warning: ProTun metadata could not be restored automatically."
   rm -rf -- /var/lib/proton-vpn-omarchy
   echo ":: Removed Proton VPN for Omarchy system services and system state."
   echo ":: User state is removed by the plugin's clean-uninstall action."

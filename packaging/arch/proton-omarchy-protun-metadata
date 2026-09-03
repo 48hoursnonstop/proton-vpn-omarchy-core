@@ -1,72 +1,195 @@
 #!/usr/bin/bash
 set -euo pipefail
 
-descriptor=${PROTON_OMARCHY_PROTUN_DESCRIPTOR:-/usr/lib/NetworkManager/VPN/nm-protun.name}
+readonly descriptor=${PROTON_OMARCHY_PROTUN_DESCRIPTOR:-/usr/lib/NetworkManager/VPN/nm-protun.name}
+readonly state_dir=${PROTON_OMARCHY_PROTUN_STATE_DIR:-/var/lib/proton-vpn-omarchy/protun-metadata}
+readonly original_file="$state_dir/original"
+readonly descriptor_file="$state_dir/descriptor"
+readonly original_sha_file="$state_dir/original.sha256"
+readonly patched_sha_file="$state_dir/patched.sha256"
+readonly mode=${1:---normalize}
+
+case "$mode" in
+  --normalize | --restore) ;;
+  *) printf 'Usage: %s [--normalize|--restore]\n' "$0" >&2; exit 2 ;;
+esac
+
+sha256_of() {
+  sha256sum "$1" | awk '{ print $1 }'
+}
+
+valid_sha256() {
+  [[ ${1:-} =~ ^[0-9a-f]{64}$ ]]
+}
+
+expected_package_sha256() {
+  if [[ -n ${PROTON_OMARCHY_PROTUN_EXPECTED_SHA256:-} ]]; then
+    printf '%s\n' "$PROTON_OMARCHY_PROTUN_EXPECTED_SHA256"
+    return
+  fi
+
+  command -v pacman >/dev/null 2>&1 || return 0
+  local owner mtree relative
+  owner=$(pacman -Qqo "$descriptor" 2>/dev/null || true)
+  [[ -n $owner ]] || return 0
+  mtree=$(find /var/lib/pacman/local -maxdepth 2 -path "*/${owner}-*/mtree" -print -quit 2>/dev/null || true)
+  [[ -f $mtree ]] || return 0
+  relative=".${descriptor}"
+  gzip -dc "$mtree" 2>/dev/null |
+    awk -v path="$relative" '
+      $1 == path && !found {
+        for (i = 2; i <= NF; i++) {
+          if ($i ~ /^sha256digest=/) {
+            sub(/^sha256digest=/, "", $i)
+            print $i
+            found = 1
+          }
+        }
+      }
+    '
+}
+
+validate_descriptor() {
+  grep -Fxq 'service=org.freedesktop.NetworkManager.protun' "$descriptor" || {
+    printf 'proton-omarchy-protun-metadata: refusing unknown descriptor: %s\n' "$descriptor" >&2
+    exit 1
+  }
+  grep -Fxq 'program=/usr/libexec/nm-protun-service' "$descriptor" || {
+    printf 'proton-omarchy-protun-metadata: refusing unknown ProTun program\n' >&2
+    exit 1
+  }
+}
+
+normalize_to() {
+  local output=$1
+  awk '
+    BEGIN { in_vpn = 0; inserted = 0 }
+    /^supports-safe-private-file-access=/ { next }
+    /^\[VPN Connection\]$/ { in_vpn = 1; print; next }
+    in_vpn && /^supports-multiple-connections=/ {
+      print
+      if (!inserted) print "supports-safe-private-file-access=true"
+      inserted = 1
+      next
+    }
+    /^\[/ {
+      if (in_vpn && !inserted) print "supports-safe-private-file-access=true"
+      if (in_vpn) inserted = 1
+      in_vpn = 0
+      print
+      next
+    }
+    { print }
+    END { if (in_vpn && !inserted) print "supports-safe-private-file-access=true" }
+  ' "$descriptor" >"$output"
+}
+
+without_our_declaration_to() {
+  local output=$1
+  awk '
+    /^\[VPN Connection\]$/ { in_vpn = 1; print; next }
+    /^\[/ { in_vpn = 0 }
+    in_vpn && /^supports-safe-private-file-access=true$/ && !removed {
+      removed = 1
+      next
+    }
+    { print }
+  ' "$descriptor" >"$output"
+}
+
+validate_normalized() {
+  local input=$1
+  awk '
+    /^\[VPN Connection\]$/ { in_vpn = 1; next }
+    /^\[/ { in_vpn = 0 }
+    in_vpn && /^supports-safe-private-file-access=true$/ { found++ }
+    END { exit found == 1 ? 0 : 1 }
+  ' "$input"
+}
+
+record_ownership() {
+  local original=$1 patched=$2
+  install -d -m 0700 "$state_dir"
+  install -m 0600 "$original" "$original_file"
+  printf '%s\n' "$descriptor" >"$descriptor_file"
+  printf '%s\n' "$(sha256_of "$original")" >"$original_sha_file"
+  printf '%s\n' "$(sha256_of "$patched")" >"$patched_sha_file"
+  chmod 0600 "$descriptor_file" "$original_sha_file" "$patched_sha_file"
+}
+
+restore_descriptor() {
+  [[ -f $original_file && -f $descriptor_file &&
+     -f $original_sha_file && -f $patched_sha_file ]] || exit 0
+
+  local recorded_descriptor original_sha patched_sha
+  recorded_descriptor=$(<"$descriptor_file")
+  original_sha=$(<"$original_sha_file")
+  patched_sha=$(<"$patched_sha_file")
+  [[ $recorded_descriptor == "$descriptor" ]] || {
+    printf 'proton-omarchy-protun-metadata: refusing mismatched restore target\n' >&2
+    exit 1
+  }
+  valid_sha256 "$original_sha" && valid_sha256 "$patched_sha" || {
+    printf 'proton-omarchy-protun-metadata: invalid restore metadata\n' >&2
+    exit 1
+  }
+  [[ $(sha256_of "$original_file") == "$original_sha" ]] || {
+    printf 'proton-omarchy-protun-metadata: original backup failed integrity check\n' >&2
+    exit 1
+  }
+
+  if [[ -f $descriptor ]]; then
+    if [[ $(sha256_of "$descriptor") != "$patched_sha" ]]; then
+      printf 'proton-omarchy-protun-metadata: descriptor changed after repair; leaving it untouched\n' >&2
+      exit 0
+    fi
+    install -m 0644 "$original_file" "$descriptor"
+  fi
+
+  rm -f -- "$original_file" "$descriptor_file" "$original_sha_file" "$patched_sha_file"
+  rmdir --ignore-fail-on-non-empty -- "$state_dir" 2>/dev/null || true
+}
+
+if [[ $mode == --restore ]]; then
+  restore_descriptor
+  exit 0
+fi
 
 # NetworkManager 1.56+ refuses private VPN profiles unless the service declares
 # that it does not read arbitrary user files (or checks ownership itself).
-# ProTun receives its key material through D-Bus, so this declaration is the
-# accurate upstream-compatible value. Keep the repair narrow because the file
-# is owned by python-proton-vpn-api-core until Proton ships the field itself.
+# ProTun receives key material through D-Bus, so this declaration is accurate.
 [[ -f $descriptor ]] || exit 0
-grep -Fxq 'service=org.freedesktop.NetworkManager.protun' "$descriptor" || {
-  printf 'proton-omarchy-protun-metadata: refusing unknown descriptor: %s\n' "$descriptor" >&2
-  exit 1
-}
-grep -Fxq 'program=/usr/libexec/nm-protun-service' "$descriptor" || {
-  printf 'proton-omarchy-protun-metadata: refusing unknown ProTun program\n' >&2
-  exit 1
-}
-temporary=$(mktemp "${descriptor}.XXXXXX")
-trap 'rm -f "$temporary"' EXIT
-awk '
-  BEGIN { in_vpn = 0; inserted = 0 }
-  /^supports-safe-private-file-access=/ {
-    # Drop both legacy misplaced keys and an existing in-section value. A
-    # single canonical value is inserted below.
-    next
-  }
-  /^\[VPN Connection\]$/ {
-    in_vpn = 1
-    print
-    next
-  }
-  in_vpn && /^supports-multiple-connections=/ {
-    print
-    if (!inserted) print "supports-safe-private-file-access=true"
-    inserted = 1
-    next
-  }
-  /^\[/ {
-    if (in_vpn && !inserted) print "supports-safe-private-file-access=true"
-    if (in_vpn) inserted = 1
-    in_vpn = 0
-    print
-    next
-  }
-  { print }
-  END {
-    if (in_vpn && !inserted) print "supports-safe-private-file-access=true"
-  }
-' "$descriptor" >"$temporary"
+validate_descriptor
 
-awk '
-  /^\[VPN Connection\]$/ { in_vpn = 1; next }
-  /^\[/ { in_vpn = 0 }
-  in_vpn && /^supports-safe-private-file-access=true$/ { found++ }
-  END { exit found == 1 ? 0 : 1 }
-' "$temporary" || {
+temporary=$(mktemp "${descriptor}.XXXXXX")
+candidate=$(mktemp "${descriptor}.original.XXXXXX")
+trap 'rm -f "$temporary" "$candidate"' EXIT
+normalize_to "$temporary"
+validate_normalized "$temporary" || {
   printf 'proton-omarchy-protun-metadata: failed to update descriptor\n' >&2
   exit 1
 }
-if ! cmp -s "$temporary" "$descriptor"; then
-  install -m 0644 "$temporary" "$descriptor"
+
+if cmp -s "$temporary" "$descriptor"; then
+  # v0.9.3 did not record ownership. Adopt that exact legacy mutation only
+  # when removing our one declaration recreates the package-owned checksum.
+  if [[ ! -f $patched_sha_file ]]; then
+    without_our_declaration_to "$candidate"
+    expected_sha=$(expected_package_sha256)
+    if valid_sha256 "$expected_sha" && [[ $(sha256_of "$candidate") == "$expected_sha" ]]; then
+      record_ownership "$candidate" "$descriptor"
+    fi
+  fi
+  exit 0
 fi
+
+# Preserve exactly what the dependency shipped before changing it. A later
+# dependency upgrade overwrites the descriptor and this hook refreshes both
+# hashes, so uninstall never restores an older package's file.
+record_ownership "$descriptor" "$temporary"
+install -m 0644 "$temporary" "$descriptor"
 
 if [[ ${PROTON_OMARCHY_PROTUN_SKIP_RELOAD:-0} != 1 ]] &&
    systemctl is-active --quiet NetworkManager.service 2>/dev/null; then
-  # NetworkManager caches VPN plugin descriptors for the lifetime of the
-  # daemon. SIGHUP reloads its configuration but does not discover a ProTun
-  # descriptor installed in the same package transaction.
   systemctl restart NetworkManager.service || true
 fi
