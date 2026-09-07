@@ -3,9 +3,15 @@ set -euo pipefail
 
 readonly version="${1:-}"
 readonly output_argument="${2:-}"
+readonly release_tag="${3:-v$version}"
+readonly release_version="${release_tag#v}"
+readonly release_base_version="${release_version%%-rc*}"
 
-if [[ ! $version =~ ^[0-9]+\.[0-9]+\.[0-9]+$ || -z $output_argument ]]; then
-  printf 'usage: %s VERSION OUTPUT_DIRECTORY\n' "$0" >&2
+if [[ ! $version =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ||
+      -z $output_argument ||
+      ! $release_tag =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-rc[1-9][0-9]*)?$ ||
+      $release_base_version != "$version" ]]; then
+  printf 'usage: %s VERSION OUTPUT_DIRECTORY [RELEASE_TAG]\n' "$0" >&2
   exit 2
 fi
 
@@ -30,9 +36,9 @@ trap cleanup EXIT
 }
 
 readonly head_commit="$(git -C "$repo_root" rev-parse HEAD)"
-readonly tag_commit="$(git -C "$repo_root" rev-parse "v$version^{commit}")"
+readonly tag_commit="$(git -C "$repo_root" rev-parse "$release_tag^{commit}")"
 [[ $head_commit == "$tag_commit" ]] || {
-  printf 'HEAD is not the exact v%s tag commit\n' "$version" >&2
+  printf 'HEAD is not the exact %s tag commit\n' "$release_tag" >&2
   exit 1
 }
 
@@ -102,7 +108,7 @@ cp -- "$repo_root/RELEASE-SIGNING-KEY.asc" "$output_dir/"
 
 {
   printf 'source_commit=%s\n' "$head_commit"
-  printf 'source_ref=refs/tags/v%s\n' "$version"
+  printf 'source_ref=refs/tags/%s\n' "$release_tag"
   printf 'source_date_epoch=%s\n' "$source_epoch"
   printf 'rustc=%s\n' "$(rustc --version)"
   printf 'cargo=%s\n' "$(cargo --version)"

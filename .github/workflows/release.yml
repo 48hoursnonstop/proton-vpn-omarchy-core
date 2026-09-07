@@ -59,7 +59,13 @@ jobs:
         shell: bash
         working-directory: ${{ github.workspace }}
         run: |
-          version="${GITHUB_REF_NAME#v}"
+          release_version="${GITHUB_REF_NAME#v}"
+          if [[ $release_version =~ ^([0-9]+\.[0-9]+\.[0-9]+)(-rc[1-9][0-9]*)?$ ]]; then
+            version="${BASH_REMATCH[1]}"
+          else
+            printf 'unsupported release tag: %s\n' "$GITHUB_REF_NAME" >&2
+            exit 2
+          fi
           runuser --user builder -- env \
             HOME=/home/builder \
             CARGO_HOME=/home/builder/.cargo \
@@ -68,7 +74,7 @@ jobs:
             HOME=/home/builder \
             CARGO_HOME=/home/builder/.cargo \
             "$GITHUB_WORKSPACE/packaging/release/build-release" \
-            "$version" "$GITHUB_WORKSPACE/dist"
+            "$version" "$GITHUB_WORKSPACE/dist" "$GITHUB_REF_NAME"
 
       - name: Attest the package provenance
         id: provenance
