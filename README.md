@@ -61,12 +61,26 @@ Manual package downloads remain available from the [0.9.5 release][release].
 ## GNOME Keyring compatibility
 
 Omarchy's passwordless default GNOME Keyring stores secrets in a textual
-GKeyFile. GNOME Keyring can turn escaped control characters in Proton's JSON
-session—most visibly the newlines in PEM certificates—into literal characters
-after the daemon restarts. Starting with 0.9.5, the core repairs that specific
-round-trip transformation while reading the shared Proton SSO entry. The
-stored schema remains compatible with Proton's Linux components, and the core
-does not delete or recreate the user's keyring.
+GKeyFile. Escaped control characters in raw JSON sessions—most visibly
+newlines in PEM material—can be reinterpreted when the GNOME Keyring daemon
+restarts.
+
+Starting with 0.9.6, Proton VPN for Omarchy stores writable session state in
+its own Secret Service namespace, `Proton VPN for Omarchy`. Session payloads
+and the account index use versioned ASCII-only Base64URL envelopes (`pvom1:`
+and `pvom-index1:`), so raw JSON, PEM data and control characters are never
+written directly to the passwordless GKeyFile.
+
+Existing shared Proton SSO entries under the `Proton` service are treated only
+as a one-time migration source. The core can read and repair a legacy session,
+validate it, import it into the private namespace, and then leave the shared
+Proton entries untouched. Signing out removes only Proton VPN for Omarchy's
+private session and does not delete shared Proton credentials.
+
+Base64URL provides representation safety, not encryption. On Omarchy's
+passwordless keyring, confidentiality at rest still depends on the host's
+storage encryption and access controls. The core does not delete or recreate
+the user's keyring.
 
 If credentials from unrelated applications disappear, preserve
 `~/.local/share/keyrings` before troubleshooting; that indicates a broader
