@@ -100,12 +100,7 @@ fn load_private_default() -> NativeResult<Option<SessionData>> {
         let raw = match private_entry(&private_account_key(&account))?.get_password() {
             Ok(value) => value,
             Err(keyring::Error::NoEntry) => continue,
-            Err(error) => {
-                return Err(keyring_error(
-                    "read Proton VPN for Omarchy session",
-                    error,
-                ))
-            }
+            Err(error) => return Err(keyring_error("read Proton VPN for Omarchy session", error)),
         };
 
         let Some(session) = decode_session(&raw) else {
@@ -388,10 +383,7 @@ mod tests {
     #[test]
     fn private_and_legacy_account_keys_are_namespaced() {
         assert_eq!(private_account_key("test"), "account-v1-orsxg5a");
-        assert_eq!(
-            legacy_account_key("test"),
-            "proton-sso-account-orsxg5a"
-        );
+        assert_eq!(legacy_account_key("test"), "proton-sso-account-orsxg5a");
     }
 
     #[test]
