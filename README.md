@@ -56,7 +56,9 @@ recipe and uses the tracked `packaging/release/SOURCE_DATE_EPOCH`.
 
 Use the guided, signature-verifying installer in the [Omarchy plugin][plugin].
 It installs the matching package and configures systemd socket activation.
-Manual package downloads remain available from the [0.9.5 release][release].
+Manual package downloads are available from the [0.9.6 release][release].
+The stable Arch package is `0.9.6-2`, which upgrades the `0.9.6-1` candidate
+without changing the RC1 keyring format or requiring another sign-in.
 
 ## GNOME Keyring compatibility
 
@@ -77,6 +79,13 @@ validate it, import it into the private namespace, and then leave the shared
 Proton entries untouched. Signing out removes only Proton VPN for Omarchy's
 private session and does not delete shared Proton credentials.
 
+Session refreshes retain the 0.9.6-rc1 storage format and update only the
+session item when the account order and import marker are unchanged. Session
+and index payloads are validated before writing. Sign-out records the
+no-reimport marker before deleting the private session, so interrupted index
+cleanup cannot silently restore a shared legacy login on restart. Duplicate
+account names are normalized without changing their order of preference.
+
 Base64URL provides representation safety, not encryption. On Omarchy's
 passwordless keyring, confidentiality at rest still depends on the host's
 storage encryption and access controls. The core does not delete or recreate
@@ -85,6 +94,38 @@ the user's keyring.
 If credentials from unrelated applications disappear, preserve
 `~/.local/share/keyrings` before troubleshooting; that indicates a broader
 keyring problem rather than cleanup performed by this package.
+
+### Keyring regression checks
+
+The normal Rust test suite uses an in-memory Secret Service for migration,
+token refresh, sign-out, locked storage and interrupted writes. It checks
+that shared Proton and unrelated credentials are untouched, and that all
+private payloads remain ASCII-safe, including sessions containing multiline
+PEM data, control characters and Unicode.
+
+To test persistence across two actual passwordless GNOME Keyring daemon
+restarts, with synthetic credentials and temporary XDG directories on a
+private D-Bus session:
+
+```bash
+python3 tests/keyring-roundtrip.py
+```
+
+This requires Python 3, `dbus-run-session`, `gnome-keyring-daemon`, `gdbus`
+and cached Cargo dependencies. The runner verifies that its temporary
+keyring uses the textual GKeyFile backend and removes its data after testing.
+
+An additional ignored test can validate an existing private desktop session
+with the account owner's consent. It reads and round-trips credentials in
+memory without writing, importing legacy data, contacting Proton or printing
+account identifiers and secrets:
+
+```bash
+PROTON_KEYRING_READ_ONLY_TEST=1 cargo test --locked --offline \
+  --package proton-omarchy-agent \
+  native_backend::secret_store::tests::desktop_private_session_is_rc1_compatible_read_only \
+  -- --ignored --exact
+```
 
 ## Security and license
 
@@ -96,4 +137,4 @@ Original project code is GPL-3.0-or-later. Vendored and upstream-derived files
 retain their own notices and license files; see `NOTICE.md`.
 
 [plugin]: https://github.com/48hoursnonstop/proton-vpn-omarchy
-[release]: https://github.com/48hoursnonstop/proton-vpn-omarchy-core/releases/tag/v0.9.5
+[release]: https://github.com/48hoursnonstop/proton-vpn-omarchy-core/releases/tag/v0.9.6

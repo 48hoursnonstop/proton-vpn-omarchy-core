@@ -19,7 +19,12 @@ readonly script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 readonly repo_root="$(git -C "$script_dir/../.." rev-parse --show-toplevel)"
 readonly output_dir="$(realpath -m -- "$output_argument")"
 readonly package_name='proton-vpn-omarchy'
-readonly package_version="$version-1"
+readonly package_release="$(sed -n 's/^pkgrel=\([1-9][0-9]*\)$/\1/p' "$repo_root/packaging/arch/PKGBUILD")"
+[[ $package_release =~ ^[1-9][0-9]*$ ]] || {
+  printf 'PKGBUILD must declare a positive integer pkgrel\n' >&2
+  exit 2
+}
+readonly package_version="$version-$package_release"
 readonly source_name="$package_name-$version.tar.gz"
 readonly package_file="$package_name-$package_version-x86_64.pkg.tar.zst"
 readonly source_epoch="$(<"$repo_root/packaging/release/SOURCE_DATE_EPOCH")"
