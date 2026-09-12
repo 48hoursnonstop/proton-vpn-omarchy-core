@@ -2,6 +2,23 @@
 
 Each frame is one UTF-8 JSON object terminated by `\n`, maximum 64 KiB.
 
+## Saved-session recovery (0.9.7)
+
+`account.status=restoring` means that the initial credential read has not
+completed successfully. Clients should show a waiting state and hide the login
+form. A locked or unavailable keyring does not mean the user signed out.
+Background recovery retries with exponential backoff capped at 30 seconds;
+`account.retry_restore` with empty parameters requests an immediate retry and
+returns `{ "logged_in": true|false }` on a successful read. Storage failures
+remain retryable errors and leave the account in `restoring`.
+
+`account.get` remains a cached read. Login/logout and authenticated controls
+return `keyring_unavailable` while restoration is pending. Once storage is
+read successfully, the account becomes `signed_in` or (for an empty keyring)
+`signed_out`. Auto-connect observes the signed-in transition independently of
+whether the plugin is open. No credential format or namespace changes are
+part of this protocol addition.
+
 ## Concurrent requests and observable operations
 
 `hello.params.client_instance_id` identifies one frontend instance. It is bounded to 128 ASCII

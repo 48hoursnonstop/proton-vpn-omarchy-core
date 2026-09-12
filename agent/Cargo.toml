@@ -1,6 +1,6 @@
 [package]
 name = "proton-omarchy-agent"
-version = "0.9.6"
+version = "0.9.7"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
@@ -10,6 +10,7 @@ proton-omarchy-protocol = { path = "../protocol" }
 authenticator = { version = "0.4.1", default-features = false, features = ["crypto_openssl"] }
 base64 = "0.22"
 data-encoding = "2.6"
+dbus-secret-service = { version = "4.1", features = ["crypto-rust"] }
 ed25519-dalek = { version = "2.1", features = ["pkcs8", "pem", "rand_core"] }
 futures-util.workspace = true
 isocountry = "0.3"

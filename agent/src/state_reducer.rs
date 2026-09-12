@@ -76,6 +76,7 @@ pub(crate) fn apply_event(
                     .and_then(Value::as_str)
                     .unwrap_or("unknown")
                 {
+                    "restoring" => AccountStatus::Restoring,
                     "signed_out" => AccountStatus::SignedOut,
                     "signing_in" => AccountStatus::SigningIn,
                     "two_factor_required" => AccountStatus::TwoFactorRequired,

@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
-"""Exercise passwordless GNOME Keyring restarts with disposable synthetic data."""
+"""Exercise GNOME Keyring recovery/restarts with disposable synthetic data."""
 
 import json
 import os
 from pathlib import Path
 import shutil
+import socket
+import struct
 import subprocess
 import sys
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 
 REPO = Path(__file__).resolve().parent.parent
@@ -25,7 +28,7 @@ def run_phase(binary, phase, env):
     )
     if result.returncode:
         raise RuntimeError(result.stdout + result.stderr)
-    print(f"Passwordless keyring: {phase} passed", flush=True)
+    print(f"Keyring ({env.get('PROTON_KEYRING_TEST_MODE', 'passwordless')}): {phase} passed", flush=True)
 
 
 def stop_daemon(daemon):
@@ -61,15 +64,17 @@ def inside_session(binary):
         # Empty-password --unlock does not create a missing login collection.
         # Seed an empty GKeyFile in this disposable directory so no interactive
         # collection-creation prompt is needed.
+        password = env.get("PROTON_KEYRING_TEST_PASSWORD", "")
         keyrings = root / "data" / "keyrings"
         keyrings.mkdir(mode=0o700)
-        (keyrings / "login.keyring").write_text(
-            "[keyring]\ndisplay-name=Test Login\nctime=0\nmtime=0\n"
-            "lock-on-idle=false\nlock-after=false\n"
-        )
-        (keyrings / "login.keyring").chmod(0o600)
-        (keyrings / "default").write_text("login\n")
-        (keyrings / "default").chmod(0o600)
+        if not password:
+            (keyrings / "login.keyring").write_text(
+                "[keyring]\ndisplay-name=Test Login\nctime=0\nmtime=0\n"
+                "lock-on-idle=false\nlock-after=false\n"
+            )
+            (keyrings / "login.keyring").chmod(0o600)
+            (keyrings / "default").write_text("login\n")
+            (keyrings / "default").chmod(0o600)
 
         def start_daemon(log):
             daemon = subprocess.Popen(
@@ -80,7 +85,8 @@ def inside_session(binary):
                 stdout=log,
                 stderr=log,
             )
-            # EOF supplies an empty password to the disposable login keyring.
+            # Only a synthetic test password, never desktop credentials.
+            daemon.stdin.write(password.encode())
             daemon.stdin.close()
             try:
                 deadline = time.monotonic() + 10
@@ -101,12 +107,55 @@ def inside_session(binary):
                 stop_daemon(daemon)
                 raise
 
+        def recover_after(make_available):
+            (root / "recovery-waiting").unlink(missing_ok=True)
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                recovery = executor.submit(run_phase, binary, "recovery", env)
+                deadline = time.monotonic() + 10
+                while not (root / "recovery-waiting").exists():
+                    if recovery.done():
+                        recovery.result()
+                    if time.monotonic() > deadline:
+                        raise RuntimeError("restoration did not enter waiting state")
+                    time.sleep(0.05)
+                result = make_available()
+                try:
+                    recovery.result(timeout=15)
+                except BaseException:
+                    if isinstance(result, subprocess.Popen):
+                        stop_daemon(result)
+                    raise
+                return result
+
+        def unlock_daemon():
+            # Exercise the same control operation used by GNOME's PAM module.
+            # --unlock starts a daemon; it does not unlock an existing one.
+            # Protocol: daemon/control/gkd-control-client.c in GNOME/gnome-keyring.
+            # The socket and password belong only to this disposable fixture.
+            secret = password.encode()
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+                client.settimeout(5)
+                client.connect(str(root / "control" / "control"))
+                client.sendall(bytes([0]) + struct.pack("!III", 12 + len(secret), 1, len(secret)) + secret)
+                with client.makefile("rb") as response:
+                    if response.read(8) != struct.pack("!II", 8, 0):
+                        raise RuntimeError("synthetic login keyring unlock failed")
+
         with (root / "daemon.log").open("w") as log:
-            for phases in (("seed",), ("restore", "delete"), ("signed-out",)):
-                daemon = start_daemon(log)
+            for phases in (("empty", "seed", "locked"), ("restore", "delete"), ("signed-out",)):
+                if phases[0] == "restore":
+                    # Restore before Secret Service exists, then start it without
+                    # restarting the process waiting for its saved session.
+                    daemon = recover_after(lambda: start_daemon(log))
+                else:
+                    daemon = start_daemon(log)
                 try:
                     for phase in phases:
                         run_phase(binary, phase, env)
+                        if phase == "locked" and password:
+                            # Unlock a password-protected collection in place,
+                            # just as desktop authentication would after login.
+                            recover_after(unlock_daemon)
                 except BaseException:
                     log.flush()
                     print((root / "daemon.log").read_text(), file=sys.stderr)
@@ -114,8 +163,10 @@ def inside_session(binary):
                 finally:
                     stop_daemon(daemon)
                 files = list((root / "data" / "keyrings").glob("*.keyring"))
-                if not files or not all(path.read_bytes().startswith(b"[keyring]") for path in files):
-                    raise RuntimeError("test did not use the passwordless GKeyFile backend")
+                if not files or not all(
+                    path.read_bytes().startswith(b"[keyring]") == (not password) for path in files
+                ):
+                    raise RuntimeError("test did not use the expected keyring storage format")
         print("Two daemon restarts passed; shared and unrelated test credentials survived.")
 
 
@@ -143,11 +194,22 @@ def main():
     if len(binaries) != 1:
         raise RuntimeError("could not identify the agent test binary")
     env = dict(os.environ, PROTON_KEYRING_PARENT_BUS=os.environ.get("DBUS_SESSION_BUS_ADDRESS", ""))
-    subprocess.run(
-        ["dbus-run-session", "--", sys.executable, str(Path(__file__).resolve()),
-         "--inside-session", binaries[0]],
-        env=env, check=True, timeout=120,
-    )
+    # Disable activation of host services: a missing test daemon must never
+    # start another keyring with the desktop's environment/data directories.
+    with tempfile.TemporaryDirectory(prefix="proton-keyring-bus-") as directory:
+        config = Path(directory) / "session.conf"
+        config.write_text("""<busconfig><type>session</type>
+<listen>unix:tmpdir=/tmp</listen><auth>EXTERNAL</auth>
+<policy context="default"><allow own="*"/><allow send_destination="*"/>
+<allow receive_sender="*"/></policy></busconfig>""")
+        for mode, password in (("passwordless", ""), ("encrypted", "synthetic-test-password")):
+            subprocess.run(
+                ["dbus-run-session", "--config-file", str(config), "--", sys.executable,
+                 str(Path(__file__).resolve()), "--inside-session", binaries[0]],
+                env={**env, "PROTON_KEYRING_TEST_MODE": mode,
+                     "PROTON_KEYRING_TEST_PASSWORD": password},
+                check=True, timeout=120,
+            )
 
 
 if __name__ == "__main__":

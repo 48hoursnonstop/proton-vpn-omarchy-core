@@ -138,6 +138,97 @@ fn session() -> SessionData {
     }
 }
 
+#[tokio::test]
+async fn failed_restoration_preserves_policy_and_recovers_without_relogin() {
+    use crate::native_backend::{ensure_session_restored, restore_saved_session, RuntimeState};
+    use tokio::sync::RwLock;
+
+    let state = RwLock::new(RuntimeState {
+        session_restore_pending: true,
+        settings: crate::native_backend::models::NativeSettings {
+            killswitch: 2,
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    for _ in 0..2 {
+        let failed = restore_saved_session(&state, || {
+            Err(NativeError::new(
+                "secret_service_error",
+                "storage unavailable",
+            ))
+        })
+        .await;
+        assert!(failed.is_err());
+        let pending = state.read().await;
+        assert!(pending.session_restore_pending);
+        assert!(pending.session.is_none());
+        assert_eq!(pending.settings.killswitch, 2);
+        assert_eq!(
+            ensure_session_restored(&pending).unwrap_err().code,
+            "keyring_unavailable"
+        );
+    }
+    assert!(restore_saved_session(&state, || Ok(Some(session())))
+        .await
+        .unwrap());
+    {
+        let restored = state.read().await;
+        assert!(!restored.session_restore_pending);
+        assert!(restored.session.as_ref().unwrap().is_authenticated());
+        assert_eq!(restored.settings.killswitch, 2);
+        ensure_session_restored(&restored).unwrap();
+    }
+    // A queued retry must not read storage or resurrect credentials after an
+    // explicit sign-out/new login resolves the pending state.
+    state.write().await.session = None;
+    assert!(
+        !restore_saved_session(&state, || panic!("unexpected keyring read"))
+            .await
+            .unwrap()
+    );
+}
+
+#[tokio::test]
+async fn empty_keyring_finishes_restoration_and_allows_login() {
+    use crate::native_backend::{ensure_session_restored, restore_saved_session, RuntimeState};
+    let state = tokio::sync::RwLock::new(RuntimeState {
+        session_restore_pending: true,
+        ..Default::default()
+    });
+    assert!(restore_saved_session(&state, || Ok(None)).await.unwrap());
+    let state = state.read().await;
+    assert!(state.session.is_none());
+    assert!(!state.session_restore_pending);
+    ensure_session_restored(&state).unwrap();
+}
+
+#[test]
+fn unavailable_keyring_at_startup_keeps_saved_settings() {
+    use crate::native_backend::{load_state_with, models::NativeSettings, Paths};
+    let root = std::env::temp_dir().join(format!("proton-startup-test-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&root).unwrap();
+    let paths = Paths {
+        settings: root.join("settings.json"),
+        catalog: root.join("serverlist.json"),
+        client_config: root.join("clientconfig.json"),
+        statistics: root.join("statistics.json"),
+    };
+    let settings = NativeSettings {
+        killswitch: 2,
+        privacy_consent_version: 1,
+        ..Default::default()
+    };
+    std::fs::write(&paths.settings, serde_json::to_vec(&settings).unwrap()).unwrap();
+    let state = load_state_with(&paths, || {
+        Err(NativeError::new("secret_service_error", "locked"))
+    });
+    assert!(state.session_restore_pending);
+    assert!(state.session.is_none());
+    assert_eq!(state.settings.killswitch, 2);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 #[test]
 fn private_and_legacy_account_keys_are_namespaced() {
     assert_eq!(private_account_key("test"), "account-v1-orsxg5a");
@@ -639,6 +730,70 @@ fn isolated_passwordless_keyring_restart() {
     legacy_expected.vpn.certificate.client_key = "synthetic-public-key".into();
     let store = SecretStore;
     let phase = std::env::var("PROTON_KEYRING_TEST_PHASE").unwrap();
+    if phase == "recovery" {
+        use crate::native_backend::{load_state, restore_saved_session, Paths};
+        use std::time::{Duration, Instant};
+        let paths = Paths {
+            settings: root.join("config/settings.json"),
+            catalog: root.join("cache/serverlist.json"),
+            client_config: root.join("cache/clientconfig.json"),
+            statistics: root.join("config/statistics.json"),
+        };
+        let state = tokio::sync::RwLock::new(load_state(&paths));
+        assert!(state.blocking_read().session_restore_pending);
+        std::fs::write(root.join("recovery-waiting"), b"ready").unwrap();
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                if restore_saved_session(&state, || SecretStore.load_default())
+                    .await
+                    .is_ok()
+                {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "saved session did not recover");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            let state = state.read().await;
+            assert!(!state.session_restore_pending);
+            assert_eq!(
+                serde_json::to_value(state.session.as_ref().unwrap()).unwrap(),
+                serde_json::to_value(&expected).unwrap()
+            );
+        });
+        return;
+    }
+    if phase == "empty" {
+        assert!(store.load_default().unwrap().is_none());
+        return;
+    }
+    if phase == "locked" {
+        let desktop = DesktopSecretService::connect(EncryptionType::Dh).unwrap();
+        let collection = desktop.get_default_collection().unwrap();
+        collection.lock().unwrap();
+        assert!(collection.is_locked().unwrap());
+        if std::env::var("PROTON_KEYRING_TEST_PASSWORD")
+            .unwrap_or_default()
+            .is_empty()
+        {
+            assert!(
+                store.load_default().unwrap().is_some(),
+                "passwordless storage unlocks silently"
+            );
+            return;
+        }
+        for _ in 0..2 {
+            assert_eq!(
+                store.load_default().unwrap_err().code,
+                "secret_service_error"
+            );
+            assert!(
+                collection.is_locked().unwrap(),
+                "background reads must not unlock storage"
+            );
+        }
+        return;
+    }
     match phase.as_str() {
         "seed" => {
             // Only synthetic data in the runner's private D-Bus session and

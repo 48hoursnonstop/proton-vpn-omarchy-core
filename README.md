@@ -97,23 +97,34 @@ keyring problem rather than cleanup performed by this package.
 
 ### Keyring regression checks
 
+The 0.9.7-rc1 candidate also recovers sessions when Secret Service starts late
+or the desktop keyring is initially locked. The account remains `restoring`
+until storage can be read; it is not treated as a fresh sign-out. Retries back
+off from one second to a maximum interval of 30 seconds. The plugin can request
+an immediate retry with `account.retry_restore`.
+
+Passwordless collections can unlock silently. Password-protected collections
+wait for desktop authentication without repeated unlock dialogs. Saved VPN
+settings remain loaded throughout, and auto-connect runs once the account is
+available. The 0.9.6-rc1 credential envelopes and private namespace are unchanged.
+
 The normal Rust test suite uses an in-memory Secret Service for migration,
 token refresh, sign-out, locked storage and interrupted writes. It checks
 that shared Proton and unrelated credentials are untouched, and that all
 private payloads remain ASCII-safe, including sessions containing multiline
 PEM data, control characters and Unicode.
 
-To test persistence across two actual passwordless GNOME Keyring daemon
-restarts, with synthetic credentials and temporary XDG directories on a
-private D-Bus session:
+To test empty, locked, delayed-start and restarted GNOME Keyring storage, with
+synthetic credentials and temporary XDG directories on a private D-Bus session:
 
 ```bash
 python3 tests/keyring-roundtrip.py
 ```
 
 This requires Python 3, `dbus-run-session`, `gnome-keyring-daemon`, `gdbus`
-and cached Cargo dependencies. The runner verifies that its temporary
-keyring uses the textual GKeyFile backend and removes its data after testing.
+and cached Cargo dependencies. The runner checks both passwordless GKeyFile
+and password-protected collections across two daemon restarts each. Host
+D-Bus service activation is disabled, and temporary data is removed afterward.
 
 An additional ignored test can validate an existing private desktop session
 with the account owner's consent. It reads and round-trips credentials in

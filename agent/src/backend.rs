@@ -10,6 +10,7 @@ pub enum BackendFlavor {
 
 const NATIVE_METHODS: &[&str] = &[
     "account.get",
+    "account.retry_restore",
     "account.upgrade_url",
     "report_issue.categories.get",
     "report_issue.submit",

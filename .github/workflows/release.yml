@@ -28,7 +28,7 @@ jobs:
             'Server = https://archive.archlinux.org/repos/2026/08/28/$repo/os/$arch' \
             >/etc/pacman.d/mirrorlist
           pacman --sync --refresh --refresh --sysupgrade --noconfirm \
-            dbus git github-cli openssl rust systemd
+            dbus git github-cli openssl rust systemd gnome-keyring python
           useradd --create-home --user-group builder
 
       - name: Check out the exact tag
@@ -70,6 +70,10 @@ jobs:
             HOME=/home/builder \
             CARGO_HOME=/home/builder/.cargo \
             cargo fetch --locked --manifest-path "$GITHUB_WORKSPACE/Cargo.toml"
+          runuser --user builder -- env \
+            HOME=/home/builder \
+            CARGO_HOME=/home/builder/.cargo \
+            python3 "$GITHUB_WORKSPACE/tests/keyring-roundtrip.py"
           runuser --user builder -- env \
             HOME=/home/builder \
             CARGO_HOME=/home/builder/.cargo \

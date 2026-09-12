@@ -205,6 +205,7 @@ struct TrafficSample {
 #[derive(Default)]
 struct RuntimeState {
     session: Option<SessionData>,
+    session_restore_pending: bool,
     catalog: Option<ServerCatalog>,
     client_config: Option<ClientConfig>,
     settings: NativeSettings,
@@ -289,7 +290,10 @@ async fn run(mut rx: mpsc::Receiver<BackendRequest>, events: EventSink) {
         network: NetworkManagerBackend,
         split_tunnel: SplitTunnelBackend,
         paths,
-        state: RwLock::new(RuntimeState::default()),
+        state: RwLock::new(RuntimeState {
+            session_restore_pending: true,
+            ..RuntimeState::default()
+        }),
         network_write: Mutex::new(()),
         settings_write: Mutex::new(()),
         telemetry_write: Arc::new(Mutex::new(())),
@@ -307,7 +311,9 @@ async fn run(mut rx: mpsc::Receiver<BackendRequest>, events: EventSink) {
         connection_attempt: AtomicU64::new(0),
     });
 
+    runtime.emit_account().await;
     runtime.initialize().await;
+    NativeRuntime::spawn_session_recovery(&runtime);
     NativeRuntime::spawn_maintenance(&runtime);
     while let Some(request) = rx.recv().await {
         let runtime = Arc::clone(&runtime);
@@ -322,6 +328,54 @@ async fn run(mut rx: mpsc::Receiver<BackendRequest>, events: EventSink) {
 }
 
 impl NativeRuntime {
+    fn spawn_session_recovery(runtime: &Arc<Self>) {
+        let runtime = Arc::downgrade(runtime);
+        tokio::spawn(async move {
+            let mut delay = Duration::from_secs(1);
+            loop {
+                tokio::time::sleep(delay).await;
+                let Some(runtime) = runtime.upgrade() else {
+                    break;
+                };
+                if !runtime.state.read().await.session_restore_pending {
+                    break;
+                }
+                // Reads are noninteractive; password-protected storage waits
+                // for the desktop to unlock it. Never log credential data.
+                let _ = runtime.restore_session().await;
+                delay = (delay * 2).min(Duration::from_secs(30));
+            }
+        });
+    }
+
+    async fn restore_session(self: &Arc<Self>) -> NativeResult<Value> {
+        // Serialize with login/logout, including the blocking storage read, so
+        // a delayed restoration cannot resurrect or overwrite another session.
+        let _auth = self.auth_write.lock().await;
+        let secret_store = self.secret_store.clone();
+        let restored =
+            restore_saved_session(&self.state, move || secret_store.load_default()).await?;
+        if restored {
+            let _network = self.network_write.lock().await;
+            if let Ok(observation) = self.observe_blocking().await {
+                self.emit_connection(&observation, None).await;
+                if observation.owned && observation.state == TunnelState::Connected {
+                    self.restore_owned_local_agent(&observation).await;
+                }
+            }
+            drop(_network);
+            self.emit_backend_state(None).await;
+            self.emit_account().await;
+            self.emit_features().await;
+            let runtime = Arc::clone(self);
+            tokio::spawn(async move {
+                runtime.refresh_connection_feedback_flag().await;
+                runtime.flush_statistics_queue().await;
+            });
+        }
+        Ok(json!({ "logged_in": self.state.read().await.session.is_some() }))
+    }
+
     fn spawn_maintenance(runtime: &Arc<Self>) {
         let token_runtime = Arc::downgrade(runtime);
         tokio::spawn(async move {
@@ -416,9 +470,11 @@ impl NativeRuntime {
         let loaded = tokio::task::spawn_blocking(move || load_state(&paths)).await;
         let mut initialization_error = None;
         match loaded {
-            Ok(Ok(state)) => *self.state.write().await = state,
-            Ok(Err(error)) => initialization_error = Some(error.to_string()),
+            Ok(state) => *self.state.write().await = state,
             Err(error) => {
+                let mut state = load_cached_state(&self.paths, None);
+                state.session_restore_pending = true;
+                *self.state.write().await = state;
                 initialization_error = Some(format!("Rust backend initialization failed: {error}"))
             }
         }
@@ -515,7 +571,10 @@ impl NativeRuntime {
                             *self.owned_connection_uuid.lock().await = observation.uuid.clone();
                             self.disconnect_after_local_agent_rejection().await;
                         }
-                    } else if observation.owned && observation.state == TunnelState::Connected {
+                    } else if observation.owned
+                        && observation.state == TunnelState::Connected
+                        && !self.state.read().await.session_restore_pending
+                    {
                         self.restore_owned_local_agent(&observation).await;
                     }
                 }
@@ -556,6 +615,7 @@ impl NativeRuntime {
                 self.emit_features().await;
                 Ok(json!({ "logged_in": self.state.read().await.session.is_some() }))
             }
+            "account.retry_restore" => self.restore_session().await,
             "account.upgrade_url" => self.account_upgrade_url(params).await,
             "report_issue.categories.get" => self.report_issue_categories().await,
             "report_issue.submit" => self.report_issue_submit(params).await,
@@ -591,6 +651,7 @@ impl NativeRuntime {
 
     async fn require_session(&self) -> NativeResult<(SessionData, u8)> {
         let state = self.state.read().await;
+        ensure_session_restored(&state)?;
         let session = state.session.clone().ok_or_else(|| {
             NativeError::new(
                 "not_authenticated",
@@ -690,7 +751,7 @@ impl NativeRuntime {
                 "sso_supported": true,
             }),
             None => json!({
-                "status": "signed_out",
+                "status": if state.session_restore_pending { "restoring" } else { "signed_out" },
                 "name": null,
                 "tier": null,
                 "credentialless": false,
@@ -705,6 +766,7 @@ impl NativeRuntime {
 
     async fn account_login(&self, mut params: Value) -> NativeResult<Value> {
         let _auth = self.auth_write.lock().await;
+        ensure_session_restored(&*self.state.read().await)?;
         let username = take_required_param(&mut params, "username", 320, true)?;
         let password = Zeroizing::new(take_required_param(&mut params, "password", 4096, false)?);
         if self.state.read().await.session.is_some() {
@@ -1024,6 +1086,7 @@ impl NativeRuntime {
 
     async fn account_logout(&self) -> NativeResult<Value> {
         let _auth = self.auth_write.lock().await;
+        ensure_session_restored(&*self.state.read().await)?;
         self.events
             .stage("account.logout", "auth.disconnecting", false);
         let observation = self.observe_blocking().await?;
@@ -3369,9 +3432,55 @@ fn unix_seconds() -> NativeResult<u64> {
         })
 }
 
-fn load_state(paths: &Paths) -> NativeResult<RuntimeState> {
-    let session = SecretStore.load_default()?;
-    Ok(load_cached_state(paths, session))
+fn load_state(paths: &Paths) -> RuntimeState {
+    load_state_with(paths, || SecretStore.load_default())
+}
+
+fn load_state_with(
+    paths: &Paths,
+    load: impl FnOnce() -> NativeResult<Option<SessionData>>,
+) -> RuntimeState {
+    // Keyring availability must not reset independently persisted VPN policy.
+    let mut state = load_cached_state(paths, None);
+    match load() {
+        Ok(session) => state.session = session,
+        Err(_) => {
+            state.session_restore_pending = true;
+            eprintln!(
+                "proton-omarchy-agent: saved session unavailable; waiting for desktop keyring"
+            );
+        }
+    }
+    state
+}
+
+fn ensure_session_restored(state: &RuntimeState) -> NativeResult<()> {
+    if state.session_restore_pending {
+        return Err(NativeError::new(
+            "keyring_unavailable",
+            "Waiting for the desktop keyring to restore the saved Proton session",
+        )
+        .retryable(true));
+    }
+    Ok(())
+}
+
+// The caller holds auth_write across this read and the publication of account
+// state. Injectable loading exercises delayed/failing reads without desktop data.
+async fn restore_saved_session(
+    state: &RwLock<RuntimeState>,
+    load: impl FnOnce() -> NativeResult<Option<SessionData>> + Send + 'static,
+) -> NativeResult<bool> {
+    if !state.read().await.session_restore_pending {
+        return Ok(false);
+    }
+    let session = tokio::task::spawn_blocking(load)
+        .await
+        .map_err(join_error)??;
+    let mut state = state.write().await;
+    state.session = session;
+    state.session_restore_pending = false;
+    Ok(true)
 }
 
 fn load_cached_state(paths: &Paths, session: Option<SessionData>) -> RuntimeState {
@@ -3388,6 +3497,7 @@ fn load_cached_state(paths: &Paths, session: Option<SessionData>) -> RuntimeStat
     }
     RuntimeState {
         session,
+        session_restore_pending: false,
         catalog,
         client_config,
         settings,

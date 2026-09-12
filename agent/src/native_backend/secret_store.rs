@@ -1,7 +1,9 @@
 use super::{models::SessionData, NativeError, NativeResult};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use data_encoding::BASE32_NOPAD;
+use dbus_secret_service::{EncryptionType, SecretService as DesktopSecretService};
 use keyring::Entry;
+use std::collections::HashMap;
 use zeroize::Zeroizing;
 
 const SERVICE: &str = "Proton VPN for Omarchy";
@@ -47,9 +49,53 @@ trait SecretService {
 
 impl SecretService for SecretStore {
     fn read(&self, service: &str, username: &str) -> keyring::Result<Zeroizing<String>> {
-        Entry::new(service, username)?
-            .get_password()
-            .map(Zeroizing::new)
+        // keyring::Entry::get_password automatically prompts to unlock locked
+        // items. Startup/retry reads must never launch an unlock prompt. Match
+        // keyring 3's target-aware search and default-collection legacy fallback,
+        // A zero prompt timeout still permits silent passwordless unlocking,
+        // but never shows a password dialog or waits for user input.
+        let desktop = DesktopSecretService::connect_with_max_prompt_timeout(EncryptionType::Dh, 0)
+            .map_err(storage_access_error)?;
+        let attributes = HashMap::from([("service", service), ("username", username)]);
+        let mut targeted = attributes.clone();
+        targeted.insert("target", "default");
+        let found = desktop
+            .search_items(targeted)
+            .map_err(storage_access_error)?;
+        let found: Vec<_> = found.unlocked.into_iter().chain(found.locked).collect();
+        let collection;
+        let items = if found.is_empty() {
+            collection = match desktop.get_default_collection() {
+                Ok(collection) => collection,
+                // A reachable service with no default collection is a fresh
+                // install. Do not create a collection just to check for a login.
+                Err(dbus_secret_service::Error::NoResult) => return Err(keyring::Error::NoEntry),
+                Err(error) => return Err(storage_access_error(error)),
+            };
+            collection.ensure_unlocked().map_err(storage_access_error)?;
+            collection
+                .search_items(attributes)
+                .map_err(storage_access_error)?
+        } else {
+            found
+        };
+        if items.is_empty() {
+            return Err(keyring::Error::NoEntry);
+        }
+        if items.len() > 1 {
+            // Preserve ambiguity rather than choosing or deleting an entry.
+            let credentials = items
+                .iter()
+                .map(|item| {
+                    keyring::secret_service::SsCredential::new_from_item(item).map(|credential| {
+                        Box::new(credential) as Box<keyring::credential::Credential>
+                    })
+                })
+                .collect::<keyring::Result<Vec<_>>>()?;
+            return Err(keyring::Error::Ambiguous(credentials));
+        }
+        items[0].ensure_unlocked().map_err(storage_access_error)?;
+        keyring::secret_service::get_item_password(&items[0]).map(Zeroizing::new)
     }
 
     fn write_private(&self, username: &str, value: &str) -> keyring::Result<()> {
@@ -59,6 +105,10 @@ impl SecretService for SecretStore {
     fn delete_private(&self, username: &str) -> keyring::Result<()> {
         Entry::new(SERVICE, username)?.delete_credential()
     }
+}
+
+fn storage_access_error(error: dbus_secret_service::Error) -> keyring::Error {
+    keyring::Error::NoStorageAccess(Box::new(error))
 }
 
 fn load_default(store: &impl SecretService) -> NativeResult<Option<SessionData>> {

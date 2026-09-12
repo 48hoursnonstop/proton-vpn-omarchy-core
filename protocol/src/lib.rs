@@ -14,6 +14,7 @@ fn default_true() -> bool {
 /// beside its dispatcher in `agent/src/backend.rs`.
 pub const BACKEND_METHODS: &[&str] = &[
     "account.get",
+    "account.retry_restore",
     "account.upgrade_url",
     "report_issue.categories.get",
     "report_issue.submit",
@@ -446,6 +447,7 @@ impl Default for AccountState {
 #[serde(rename_all = "snake_case")]
 pub enum AccountStatus {
     Unknown,
+    Restoring,
     SignedOut,
     SigningIn,
     TwoFactorRequired,
