@@ -56,8 +56,8 @@ recipe and uses the tracked `packaging/release/SOURCE_DATE_EPOCH`.
 
 Use the guided, signature-verifying installer in the [Omarchy plugin][plugin].
 It installs the matching package and configures systemd socket activation.
-Manual package downloads are available from the [0.9.6 release][release].
-The stable Arch package is `0.9.6-2`, which upgrades the `0.9.6-1` candidate
+Manual package downloads are available from the [0.9.7 release][release].
+The stable Arch package is `0.9.7-2`, which upgrades the `0.9.7-1` candidate
 without changing the RC1 keyring format or requiring another sign-in.
 
 ## GNOME Keyring compatibility
@@ -97,7 +97,7 @@ keyring problem rather than cleanup performed by this package.
 
 ### Keyring regression checks
 
-The 0.9.7-rc1 candidate also recovers sessions when Secret Service starts late
+Version 0.9.7 also recovers sessions when Secret Service starts late
 or the desktop keyring is initially locked. The account remains `restoring`
 until storage can be read; it is not treated as a fresh sign-out. Retries back
 off from one second to a maximum interval of 30 seconds. The plugin can request
@@ -148,4 +148,4 @@ Original project code is GPL-3.0-or-later. Vendored and upstream-derived files
 retain their own notices and license files; see `NOTICE.md`.
 
 [plugin]: https://github.com/48hoursnonstop/proton-vpn-omarchy
-[release]: https://github.com/48hoursnonstop/proton-vpn-omarchy-core/releases/tag/v0.9.6
+[release]: https://github.com/48hoursnonstop/proton-vpn-omarchy-core/releases/tag/v0.9.7
