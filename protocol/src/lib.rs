@@ -497,6 +497,10 @@ pub struct ConnectionState {
     pub profile_id: Option<String>,
     pub country_code: Option<String>,
     pub country_name: Option<String>,
+    #[serde(default)]
+    pub host_country_code: Option<String>,
+    #[serde(default)]
+    pub host_country_name: Option<String>,
     pub entry_country_code: Option<String>,
     pub entry_country_name: Option<String>,
     pub state: Option<String>,
@@ -532,6 +536,8 @@ impl Default for ConnectionState {
             profile_id: None,
             country_code: None,
             country_name: None,
+            host_country_code: None,
+            host_country_name: None,
             entry_country_code: None,
             entry_country_name: None,
             state: None,
@@ -730,6 +736,8 @@ pub struct ConnectionFeedbackState {
     pub available: bool,
     pub viewed: bool,
     pub sent: bool,
+    #[serde(default)]
+    pub auto_dismiss_seconds: u32,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

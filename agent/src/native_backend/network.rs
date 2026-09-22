@@ -213,6 +213,7 @@ impl ProtunProfile {
         settings: &NativeSettings,
         profile_id: Option<String>,
     ) -> NativeResult<Self> {
+        super::server_validation::validate(&target.physical)?;
         let (udp_ports, tcp_ports, tls_ports) = match protocol {
             "protun-smart" | "smart" => (
                 client_config.default_ports.wire_guard.udp.clone(),
@@ -289,6 +290,8 @@ impl ProtunProfile {
         prop(&mut connection, "id", self.id.clone());
         prop(&mut connection, "uuid", self.uuid.clone());
         prop(&mut connection, "type", "vpn".to_owned());
+        // Disable link-local name resolution on the VPN interface only.
+        prop(&mut connection, "llmnr", 0_i32);
         prop(
             &mut connection,
             "stable-id",
@@ -378,6 +381,7 @@ impl OpenVpnProfile {
         settings: &NativeSettings,
         profile_id: Option<String>,
     ) -> NativeResult<Self> {
+        super::server_validation::validate(&target.physical)?;
         let protocol = normalize_protocol(protocol);
         let ports = match protocol.as_str() {
             "openvpn-udp" => &client_config.default_ports.open_vpn.udp,
@@ -474,6 +478,8 @@ impl OpenVpnProfile {
         prop(&mut connection, "id", self.id.clone());
         prop(&mut connection, "uuid", self.uuid.clone());
         prop(&mut connection, "type", "vpn".to_owned());
+        // Disable link-local name resolution on the VPN interface only.
+        prop(&mut connection, "llmnr", 0_i32);
         prop(
             &mut connection,
             "interface-name",
@@ -1895,7 +1901,7 @@ mod tests {
     #[test]
     fn openvpn_networkmanager_profile_has_complete_tls_contract() {
         let root = PathBuf::from("/run/user/1000/proton-omarchy/openvpn/test");
-        let profile = OpenVpnProfile {
+        let mut profile = OpenVpnProfile {
             id: "ProtonVPN MX#1".into(),
             uuid: "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee".into(),
             protocol: "openvpn-tcp".into(),
@@ -1917,6 +1923,12 @@ mod tests {
             .into_iter()
             .map(|(key, value)| (key.to_owned(), value))
             .collect::<HashMap<_, _>>();
+        assert_eq!(settings["connection"]["llmnr"].0.as_i64(), Some(0));
+        assert_eq!(settings["ipv6"]["method"].0.as_str(), Some("auto"));
+        profile.enable_ipv6 = false;
+        let ipv4_only = profile.dbus_settings();
+        assert_eq!(ipv4_only["ipv6"]["method"].0.as_str(), Some("disabled"));
+        assert!(!ipv4_only["ipv6"].contains_key("dns-data"));
         assert_eq!(service_type(&settings).as_deref(), Some(OPENVPN_SERVICE));
         assert_eq!(profile_protocol(&settings).as_deref(), Some("openvpn-tcp"));
         assert_eq!(profile_endpoint(&settings).as_deref(), Some("192.0.2.1"));
@@ -1973,5 +1985,71 @@ mod tests {
         assert!(is_conflicting_tunnel_name("tailscale0"));
         assert!(!is_conflicting_tunnel_name("wlp0s20f3"));
         assert_eq!(conflict_label("Work VPN", Some("tun0")), "Work VPN (tun0)");
+    }
+    #[test]
+    fn tunnel_boundary_rejects_unsigned_endpoints_before_building_profiles() {
+        let session: SessionData = serde_json::from_value(json!({
+            "UID": "test", "AccessToken": "test", "RefreshToken": "test", "AccountName": "test",
+            "vpn": {"vpninfo": {}, "certificate": {"Certificate": "", "ClientKey": "",
+                "ExpirationTime": 0, "RefreshTime": 0},
+                "secrets": {"ed25519_privatekey": ""}, "location": {}}
+        }))
+        .unwrap();
+        let logical =
+            serde_json::from_value(json!({"ID": "test", "Name": "TEST", "EntryCountry": "US",
+            "ExitCountry": "US", "Tier": 0, "Features": 0, "Load": 0, "Score": 1.0, "Status": 1,
+            "Location": {"Lat": 0, "Long": 0}, "Servers": []}))
+            .unwrap();
+        let mut physical = super::super::server_validation::tests::signed_endpoint();
+        physical.signature = None;
+        let target = ConnectionTarget { logical, physical };
+        let config =
+            serde_json::from_value(json!({"DefaultPorts": {"WireGuard": {"UDP": [51820]}}}))
+                .unwrap();
+        for protocol in [
+            "protun-udp",
+            "protun-tcp",
+            "protun-tls",
+            "openvpn-udp",
+            "openvpn-tcp",
+        ] {
+            let error = VpnProfile::new(
+                &target,
+                protocol,
+                &session,
+                &config,
+                &NativeSettings::default(),
+                None,
+            )
+            .err()
+            .expect("must reject an unsigned endpoint");
+            assert_eq!(error.code, "server_validation_failed");
+        }
+    }
+
+    #[test]
+    fn protun_ipv6_and_link_local_dns_settings_are_explicit() {
+        for enable_ipv6 in [false, true] {
+            let profile = ProtunProfile {
+                id: "test".into(),
+                uuid: "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee".into(),
+                protocol: "protun-udp".into(),
+                profile_id: None,
+                settings_json: "{}".into(),
+                private_key: Zeroizing::new(String::new()),
+                enable_ipv6,
+                custom_dns_v4: vec![],
+                custom_dns_v6: vec!["2001:db8::53".into()],
+            };
+            let settings = profile.dbus_settings();
+            assert_eq!(settings["connection"]["llmnr"].0.as_i64(), Some(0));
+            assert_eq!(
+                settings["ipv6"]["method"].0.as_str(),
+                Some(if enable_ipv6 { "manual" } else { "disabled" })
+            );
+            assert_eq!(settings["ipv6"].contains_key("dns-data"), enable_ipv6);
+            assert_eq!(settings["ipv6"].contains_key("address-data"), enable_ipv6);
+            assert_eq!(settings["ipv4"]["dns-priority"].0.as_i64(), Some(-1500));
+        }
     }
 }

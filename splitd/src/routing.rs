@@ -479,4 +479,160 @@ mod tests {
         let error = io::Error::other("Error: ipv4: FIB table does not exist. Dump terminated");
         assert!(routing_table_absent(&error));
     }
+    #[test]
+    #[ignore = "creates an isolated user/network namespace; requires unshare and iproute2"]
+    fn isolated_dual_stack_marked_routes_and_kill_switch() {
+        const PARENT_NS: &str = "PROTON_ROUTE_TEST_PARENT_NETNS";
+        let namespace = std::fs::read_link("/proc/self/ns/net").unwrap();
+        let Some(parent) = std::env::var_os(PARENT_NS) else {
+            let status = Command::new("unshare")
+                .args(["--user", "--map-root-user", "--net"])
+                .arg(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "routing::tests::isolated_dual_stack_marked_routes_and_kill_switch",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env(PARENT_NS, namespace)
+                .status()
+                .unwrap();
+            assert!(status.success(), "isolated route test failed");
+            return;
+        };
+        assert_ne!(
+            namespace.as_os_str(),
+            parent,
+            "never modify the parent network namespace"
+        );
+        let ip = |args: &[&str]| {
+            let result = Command::new("ip").args(args).output().unwrap();
+            assert!(
+                result.status.success(),
+                "ip {args:?}: {}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            result.stdout
+        };
+        ip(&["link", "set", "lo", "up"]);
+        for name in ["physical0", "proton0"] {
+            ip(&["link", "add", name, "type", "dummy"]);
+            ip(&["link", "set", name, "up"]);
+        }
+        ip(&["addr", "add", "192.0.2.2/24", "dev", "physical0"]);
+        ip(&[
+            "-6",
+            "addr",
+            "add",
+            "2001:db8:1::2/64",
+            "dev",
+            "physical0",
+            "nodad",
+        ]);
+        ip(&["addr", "add", "10.2.0.2/32", "dev", "proton0"]);
+        ip(&[
+            "-6",
+            "addr",
+            "add",
+            "2a07:b944::2:2/128",
+            "dev",
+            "proton0",
+            "nodad",
+        ]);
+        for family in ["-4", "-6"] {
+            ip(&[
+                family, "route", "add", "default", "dev", "proton0", "metric", "10",
+            ]);
+            ip(&[
+                family,
+                "route",
+                "add",
+                "blackhole",
+                "default",
+                "metric",
+                "100",
+            ]);
+        }
+        let routes = enable(
+            0,
+            &[
+                PhysicalRoute::parse("ipv4", "192.0.2.1", "physical0").unwrap(),
+                PhysicalRoute::parse("ipv6", "2001:db8:1::1", "physical0").unwrap(),
+            ],
+        )
+        .unwrap();
+        let device_for = |family: &str, destination: &str, mark: &str| {
+            let raw = ip(&[
+                family,
+                "-j",
+                "route",
+                "get",
+                destination,
+                "mark",
+                mark,
+                "uid",
+                "0",
+            ]);
+            let routes: Value = serde_json::from_slice(&raw).unwrap();
+            routes[0]["dev"].as_str().unwrap().to_owned()
+        };
+        for (family, internet, dns) in [
+            ("-4", "198.51.100.1", "10.2.0.1"),
+            ("-6", "2001:db8:ffff::1", "2a07:b944::2:1"),
+        ] {
+            assert_eq!(
+                device_for(family, internet, "0xea13b2c"),
+                "physical0",
+                "bypass mark uses physical table"
+            );
+            assert_eq!(
+                device_for(family, internet, "0"),
+                "proton0",
+                "Include mark clearing selects VPN"
+            );
+            assert_eq!(
+                device_for(family, dns, "0"),
+                "proton0",
+                "unmarked VPN DNS stays on VPN"
+            );
+            ip(&[
+                family, "route", "del", "default", "dev", "proton0", "metric", "10",
+            ]);
+            let blocked = Command::new("ip")
+                .args([family, "route", "get", internet, "mark", "0", "uid", "0"])
+                .output()
+                .unwrap();
+            assert!(
+                !blocked.status.success(),
+                "unmarked traffic must hit the kill-switch fallback"
+            );
+            assert_eq!(
+                device_for(family, internet, "0xea13b2c"),
+                "physical0",
+                "explicit bypass survives kill switch"
+            );
+        }
+        disable(0, &routes).unwrap();
+        for family in ["-4", "-6"] {
+            let blocked = Command::new("ip")
+                .args([
+                    family,
+                    "route",
+                    "get",
+                    if family == "-4" {
+                        "198.51.100.1"
+                    } else {
+                        "2001:db8:ffff::1"
+                    },
+                    "mark",
+                    "0xea13b2c",
+                ])
+                .output()
+                .unwrap();
+            assert!(
+                !blocked.status.success(),
+                "cleanup removes only the bypass path"
+            );
+        }
+    }
 }

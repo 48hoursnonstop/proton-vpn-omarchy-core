@@ -28,6 +28,7 @@ pub struct ConnectionFeedbackSession {
     user_feedback: String,
     viewed: bool,
     sent: bool,
+    dismissed: bool,
 }
 
 impl ConnectionFeedbackSession {
@@ -40,6 +41,7 @@ impl ConnectionFeedbackSession {
             user_feedback: "unknown".into(),
             viewed: false,
             sent: false,
+            dismissed: false,
         }
     }
 
@@ -51,7 +53,14 @@ impl ConnectionFeedbackSession {
         self.sent
     }
 
+    pub fn dismissed(&self) -> bool {
+        self.dismissed
+    }
+
     pub fn update_feedback(&mut self, value: &str) {
+        if value == "dismissed" {
+            self.dismissed = true;
+        }
         self.viewed = true;
         self.user_feedback = match value {
             "positive" => {
@@ -338,16 +347,25 @@ mod tests {
                     domain: "node.example".into(),
                     status: 1,
                     x25519_public_key: String::new(),
-                    label: String::new(),
+                    label: Some(String::new()),
+                    signature: None,
                     extra: Default::default(),
                 },
             },
             "protun-tls".into(),
             "connection_card".into(),
         );
+        let mut dismissed = feedback.clone();
+        dismissed.update_feedback("viewed");
+        dismissed.update_feedback("dismissed");
+        assert!(dismissed.dismissed());
+        assert!(dismissed.viewed());
+        assert!(!dismissed.sent());
+        assert_eq!(dismissed.user_feedback, "ignore");
         feedback.update_feedback("positive");
         assert!(feedback.viewed());
         assert!(feedback.sent());
+        feedback.update_feedback("dismissed");
         assert_eq!(feedback.user_feedback, "positive");
         assert_eq!(protocol_dimension("protun-tls"), "protun_tls");
     }

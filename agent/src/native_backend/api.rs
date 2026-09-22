@@ -18,6 +18,8 @@ use std::{
 use x509_parser::parse_x509_certificate;
 use zeroize::Zeroizing;
 
+pub const SIGNED_CATALOG_ENDPOINT: &str =
+    "/vpn/v1/logicals?SecureCoreFilter=all&WithState=true&SignServer=Server.EntryIP,Server.Label";
 const API_BASE: &str = "https://vpn-api.proton.me";
 const API_CORE_COMPAT_VERSION: &str = "5.5.11";
 const MAX_API_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
@@ -344,7 +346,12 @@ impl ProtonApi {
         let encoded_name =
             url::form_urlencoded::byte_serialize(name.as_bytes()).collect::<String>();
         let payload = self
-            .get(&format!("/vpn/v1/logicals/lookup/{encoded_name}"), session)
+            .get(
+                &format!(
+                    "/vpn/v1/logicals/lookup/{encoded_name}?SignServer=Server.EntryIP,Server.Label"
+                ),
+                session,
+            )
             .await?;
         payload
             .get("LogicalServer")

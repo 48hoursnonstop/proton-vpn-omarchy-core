@@ -1,0 +1,80 @@
+diff --git i/agent/src/native_backend/catalog.rs w/agent/src/native_backend/catalog.rs
+index 30463bf..7d91e6e 100644
+--- i/agent/src/native_backend/catalog.rs
++++ w/agent/src/native_backend/catalog.rs
+@@ -957,4 +957,75 @@ mod tests {
+         assert_eq!(gateway_result["total"], 1);
+         assert_eq!(gateway_result["servers"][0]["name"], "ACME#1");
+     }
++
++    #[test]
++    fn upstream_audit_rejects_invalid_endpoint_signature() {
++        let mut server = logical("US#1", "US", 0, 0.1);
++        server.servers[0].x25519_public_key = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=".into();
++        server.servers[0]
++            .extra
++            .insert("Signature".into(), json!("invalid-signature"));
++        let catalog = ServerCatalog {
++            expiration_time: 0.0,
++            loads_expiration_time: 0.0,
++            max_tier: 0,
++            logical_servers: vec![server],
++            extra: Default::default(),
++        };
++        assert!(
++            catalog.select(&json!({"target": {}}), 0, &[], "").is_err(),
++            "Selection accepted a synthetic endpoint with an invalid signature"
++        );
++    }
++
++    #[test]
++    fn upstream_audit_rejects_malformed_endpoint_public_key() {
++        let server = logical("US#1", "US", 0, 0.1);
++        let catalog = ServerCatalog {
++            expiration_time: 0.0,
++            loads_expiration_time: 0.0,
++            max_tier: 0,
++            logical_servers: vec![server],
++            extra: Default::default(),
++        };
++        assert!(
++            catalog.select(&json!({"target": {}}), 0, &[], "").is_err(),
++            "Selection accepted the malformed public key from the synthetic fixture"
++        );
++    }
++
++    #[test]
++    fn upstream_audit_merges_city_with_missing_state() {
++        let mut first = logical("US#1", "US", 0, 0.1);
++        first.city = "Los Angeles".into();
++        first.state = "California".into();
++        let mut second = first.clone();
++        second.name = "US#2".into();
++        second.state.clear();
++        let catalog = ServerCatalog {
++            expiration_time: 0.0,
++            loads_expiration_time: 0.0,
++            max_tier: 0,
++            logical_servers: vec![first, second],
++            extra: Default::default(),
++        };
++        let locations = catalog.locations(0);
++        let country = &locations["countries"][0];
++        assert_eq!(country["states"][0]["cities"][0], "Los Angeles");
++        assert!(
++            country["cities"].as_array().unwrap().is_empty(),
++            "The same city is emitted both with and without its known state"
++        );
++    }
++
++    #[test]
++    fn upstream_audit_preserves_smart_routing_host_country() {
++        let mut server = logical("AR#1", "AR", 0, 0.1);
++        server.host_country = Some("US".into());
++        assert_eq!(
++            server.serialized()["host_country_code"],
++            "US",
++            "Frontend payload omits the physical country for Smart Routing"
++        );
++    }
+ }

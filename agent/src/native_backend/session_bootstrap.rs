@@ -24,6 +24,27 @@ pub struct BootstrapData {
     pub client_config_json: Value,
 }
 
+pub async fn fetch_catalog(
+    api: &ProtonApi,
+    auth: &ApiSession,
+    tier: u8,
+) -> NativeResult<(ServerCatalog, Value)> {
+    let now = unix_time()?;
+    let mut catalog_json = api.get(super::api::SIGNED_CATALOG_ENDPOINT, auth).await?;
+    insert_number(&mut catalog_json, "ExpirationTime", now + 3.0 * 60.0 * 60.0)?;
+    insert_number(&mut catalog_json, "LoadsExpirationTime", now + 15.0 * 60.0)?;
+    insert_u64(&mut catalog_json, "MaxTier", u64::from(tier))?;
+    let catalog: ServerCatalog = decode_api_value_ref(&catalog_json, "VPN server catalog")?;
+    if !catalog.has_endpoint_signatures() {
+        return Err(NativeError::new(
+            "server_validation_failed",
+            "Proton did not return a signed server catalog",
+        )
+        .retryable(true));
+    }
+    Ok((catalog, catalog_json))
+}
+
 pub async fn fetch(
     api: &ProtonApi,
     auth: ApiSession,
@@ -81,19 +102,7 @@ pub async fn fetch(
                 "Proton VPN account response is missing MaxTier",
             )
         })?;
-    let mut catalog_json = api
-        .get(
-            "/vpn/v1/logicals?SecureCoreFilter=all&WithState=true",
-            &auth,
-        )
-        .await?;
-    insert_number(&mut catalog_json, "ExpirationTime", now + 3.0 * 60.0 * 60.0)?;
-    insert_number(&mut catalog_json, "LoadsExpirationTime", now + 15.0 * 60.0)?;
-    insert_u64(&mut catalog_json, "MaxTier", u64::from(tier))?;
-    // Deserialize from the borrowed JSON tree. Cloning a production catalog
-    // multiplies peak memory use during login and gets increasingly expensive
-    // as Proton adds servers.
-    let catalog: ServerCatalog = decode_api_value_ref(&catalog_json, "VPN server catalog")?;
+    let (catalog, catalog_json) = fetch_catalog(api, &auth, tier).await?;
 
     let session = SessionData {
         uid: auth.uid,

@@ -25,7 +25,52 @@ pub struct ConnectionTarget {
     pub physical: PhysicalServer,
 }
 
+type CityStates = BTreeMap<(String, String), BTreeSet<String>>;
+
+fn canonical_state<'a>(server: &'a LogicalServer, states: &'a CityStates) -> &'a str {
+    if !server.state.trim().is_empty() {
+        return &server.state;
+    }
+    states
+        .get(&(server.exit_country.clone(), server.city.clone()))
+        .filter(|states| states.len() == 1)
+        .and_then(|states| states.first())
+        .map(String::as_str)
+        .unwrap_or("")
+}
+
 impl ServerCatalog {
+    fn city_states(&self) -> CityStates {
+        let mut states = CityStates::new();
+        for server in &self.logical_servers {
+            if !server.city.is_empty() && !server.state.trim().is_empty() {
+                states
+                    .entry((server.exit_country.clone(), server.city.clone()))
+                    .or_default()
+                    .insert(server.state.clone());
+            }
+        }
+        states
+    }
+
+    pub fn has_endpoint_signatures(&self) -> bool {
+        // A signed lookup inserted into an old unsigned cache must not make
+        // that whole cache appear migrated. Only active endpoints matter here.
+        let mut endpoints = self
+            .logical_servers
+            .iter()
+            .flat_map(|server| &server.servers)
+            .filter(|server| server.status == 1)
+            .peekable();
+        endpoints.peek().is_some()
+            && endpoints.all(|server| {
+                server
+                    .signature
+                    .as_deref()
+                    .is_some_and(|signature| !signature.is_empty())
+            })
+    }
+
     pub fn load(path: &Path) -> NativeResult<Self> {
         let max_catalog_bytes = MAX_SERVER_CATALOG_BYTES as u64;
         let metadata = fs::metadata(path).map_err(|error| {
@@ -73,6 +118,7 @@ impl ServerCatalog {
     }
 
     pub fn servers_page(&self, params: &Value, tier: u8) -> NativeResult<Value> {
+        let city_states = self.city_states();
         let offset = bounded_u64(params.get("offset"), 0, 1_000_000)? as usize;
         let limit = bounded_u64(params.get("limit"), 100, 100)? as usize;
         let raw_query = string(params, "query");
@@ -155,7 +201,11 @@ impl ServerCatalog {
             .into_iter()
             .skip(offset)
             .take(limit)
-            .map(LogicalServer::serialized)
+            .map(|server| {
+                let mut value = server.serialized();
+                value["state"] = json!(canonical_state(server, &city_states));
+                value
+            })
             .collect::<Vec<_>>();
 
         Ok(json!({
@@ -172,12 +222,14 @@ impl ServerCatalog {
     }
 
     pub fn locations(&self, tier: u8) -> Value {
+        let city_states = self.city_states();
         let mut countries: BTreeMap<String, Value> = BTreeMap::new();
         let mut gateways: BTreeMap<String, Value> = BTreeMap::new();
         let mut subdivisions: BTreeMap<String, BTreeMap<String, BTreeSet<String>>> =
             BTreeMap::new();
         let mut p2p_subdivisions: BTreeMap<String, BTreeMap<String, BTreeSet<String>>> =
             BTreeMap::new();
+        let mut host_countries: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
         let mut secure_core_entries: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
 
         for server in self
@@ -208,6 +260,12 @@ impl ServerCatalog {
             }
 
             let code = server.exit_country.to_ascii_uppercase();
+            if let Some(host) = server.host_country_code() {
+                host_countries
+                    .entry(code.clone())
+                    .or_default()
+                    .insert(host.to_owned());
+            }
             if server.features & FEATURE_SECURE_CORE != 0 && !server.entry_country.is_empty() {
                 secure_core_entries
                     .entry(code.clone())
@@ -215,10 +273,20 @@ impl ServerCatalog {
                     .insert(server.entry_country.to_ascii_uppercase());
             }
             if server.standard() {
-                insert_subdivision(&mut subdivisions, &code, server);
+                insert_subdivision(
+                    &mut subdivisions,
+                    &code,
+                    server,
+                    canonical_state(server, &city_states),
+                );
             }
             if server.features & FEATURE_P2P != 0 {
-                insert_subdivision(&mut p2p_subdivisions, &code, server);
+                insert_subdivision(
+                    &mut p2p_subdivisions,
+                    &code,
+                    server,
+                    canonical_state(server, &city_states),
+                );
             }
             let entry = countries.entry(code.clone()).or_insert_with(|| {
                 json!({
@@ -258,6 +326,15 @@ impl ServerCatalog {
             };
             let (states, country_cities) =
                 serialized_subdivisions(subdivisions.remove(code).unwrap_or_default());
+            country.insert(
+                "smart_routing_countries".into(),
+                json!(host_countries
+                    .remove(code)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|code| json!({"code": code, "name": country_name(&code)}))
+                    .collect::<Vec<_>>()),
+            );
             country.insert("cities".into(), json!(country_cities));
             country.insert("states".into(), json!(states));
             let (p2p_states, p2p_cities) =
@@ -295,6 +372,24 @@ impl ServerCatalog {
         excluded_locations: &[ExcludedLocation],
         device_country: &str,
     ) -> NativeResult<ConnectionTarget> {
+        self.select_validated(
+            params,
+            tier,
+            excluded_locations,
+            device_country,
+            super::server_validation::validate,
+        )
+    }
+
+    fn select_validated(
+        &self,
+        params: &Value,
+        tier: u8,
+        excluded_locations: &[ExcludedLocation],
+        device_country: &str,
+        validate: fn(&PhysicalServer) -> NativeResult<()>,
+    ) -> NativeResult<ConnectionTarget> {
+        let city_states = self.city_states();
         let target = params
             .get("target")
             .and_then(Value::as_object)
@@ -348,141 +443,166 @@ impl ServerCatalog {
             .retryable(true));
         }
 
-        let available = self
+        let mut available = self
             .logical_servers
             .iter()
             .filter(|server| server.enabled() && server.tier <= tier)
             .collect::<Vec<_>>();
 
-        let logical = if !server_name.is_empty() {
-            available
-                .iter()
-                .copied()
-                .find(|server| server.name.eq_ignore_ascii_case(&server_name))
-        } else {
-            let mut candidates = available
-                .iter()
-                .copied()
-                .filter(|server| gateway_name.is_empty() || server.gateway_name() == gateway_name)
-                .filter(|server| country_code.is_empty() || server.exit_country == country_code)
-                .filter(|server| {
-                    !exclude_my_country
-                        || !server.exit_country.eq_ignore_ascii_case(&device_country)
-                })
-                .filter(|server| {
-                    entry_country_code.is_empty()
-                        || server
-                            .entry_country
-                            .eq_ignore_ascii_case(&entry_country_code)
-                })
-                .filter(|server| {
-                    state_name.is_empty() || server.state.eq_ignore_ascii_case(&state_name)
-                })
-                .filter(|server| {
-                    city_name.is_empty() || server.city.eq_ignore_ascii_case(&city_name)
-                })
-                .filter(|server| !secure_core || server.features & FEATURE_SECURE_CORE != 0)
-                .filter(|server| !p2p || server.features & FEATURE_P2P != 0)
-                .filter(|server| !tor || server.features & FEATURE_TOR != 0)
-                .filter(|server| {
-                    secure_core || p2p || tor || !gateway_name.is_empty() || server.standard()
-                })
-                .filter(|server| !free_random || server.tier == 0)
-                .filter(|server| {
-                    exclude_server_name.is_empty()
-                        || !server.name.eq_ignore_ascii_case(&exclude_server_name)
-                })
-                .collect::<Vec<_>>();
+        let mut rejected_endpoints = false;
+        loop {
+            let logical = if !server_name.is_empty() {
+                available
+                    .iter()
+                    .copied()
+                    .find(|server| server.name.eq_ignore_ascii_case(&server_name))
+            } else {
+                let mut candidates = available
+                    .iter()
+                    .copied()
+                    .filter(|server| {
+                        gateway_name.is_empty() || server.gateway_name() == gateway_name
+                    })
+                    .filter(|server| country_code.is_empty() || server.exit_country == country_code)
+                    .filter(|server| {
+                        !exclude_my_country
+                            || !server.exit_country.eq_ignore_ascii_case(&device_country)
+                    })
+                    .filter(|server| {
+                        entry_country_code.is_empty()
+                            || server
+                                .entry_country
+                                .eq_ignore_ascii_case(&entry_country_code)
+                    })
+                    .filter(|server| {
+                        state_name.is_empty()
+                            || canonical_state(server, &city_states)
+                                .eq_ignore_ascii_case(&state_name)
+                    })
+                    .filter(|server| {
+                        city_name.is_empty() || server.city.eq_ignore_ascii_case(&city_name)
+                    })
+                    .filter(|server| !secure_core || server.features & FEATURE_SECURE_CORE != 0)
+                    .filter(|server| !p2p || server.features & FEATURE_P2P != 0)
+                    .filter(|server| !tor || server.features & FEATURE_TOR != 0)
+                    .filter(|server| {
+                        secure_core || p2p || tor || !gateway_name.is_empty() || server.standard()
+                    })
+                    .filter(|server| !free_random || server.tier == 0)
+                    .filter(|server| {
+                        exclude_server_name.is_empty()
+                            || !server.name.eq_ignore_ascii_case(&exclude_server_name)
+                    })
+                    .collect::<Vec<_>>();
 
-            let explicit_location = !server_name.is_empty()
-                || !country_code.is_empty()
-                || !entry_country_code.is_empty()
-                || !state_name.is_empty()
-                || !city_name.is_empty()
-                || !gateway_name.is_empty();
-            if tier > 0 && !explicit_location && !excluded_locations.is_empty() {
-                let before_exclusions = candidates.len();
-                candidates.retain(|server| {
-                    !excluded_locations
+                let explicit_location = !server_name.is_empty()
+                    || !country_code.is_empty()
+                    || !entry_country_code.is_empty()
+                    || !state_name.is_empty()
+                    || !city_name.is_empty()
+                    || !gateway_name.is_empty();
+                if tier > 0 && !explicit_location && !excluded_locations.is_empty() {
+                    let before_exclusions = candidates.len();
+                    candidates.retain(|server| {
+                        !excluded_locations.iter().any(|location| {
+                            excluded_location_matches(
+                                location,
+                                server,
+                                canonical_state(server, &city_states),
+                            )
+                        })
+                    });
+                    if before_exclusions > 0 && candidates.is_empty() {
+                        return Err(NativeError::new(
+                            "all_candidates_excluded",
+                            "Every available server for this connection is in Excluded locations",
+                        ));
+                    }
+                }
+
+                if random_target || free_random {
+                    // Windows' "Random country" is uniform over eligible countries,
+                    // then selects that country's best server. Choosing a logical
+                    // server directly would bias countries with larger fleets.
+                    let countries = candidates
                         .iter()
-                        .any(|location| excluded_location_matches(location, server))
-                });
-                if before_exclusions > 0 && candidates.is_empty() {
-                    return Err(NativeError::new(
-                        "all_candidates_excluded",
-                        "Every available server for this connection is in Excluded locations",
-                    ));
+                        .map(|server| server.exit_country.as_str())
+                        .collect::<BTreeSet<_>>()
+                        .into_iter()
+                        .collect::<Vec<_>>();
+                    let selected_country = countries.choose(&mut rand::rng()).copied();
+                    candidates
+                        .retain(|server| selected_country == Some(server.exit_country.as_str()));
+                }
+                if random_server {
+                    candidates.choose(&mut rand::rng()).copied()
+                } else {
+                    candidates.sort_by(|left, right| {
+                        left.score
+                            .partial_cmp(&right.score)
+                            .unwrap_or(Ordering::Equal)
+                    });
+                    candidates.first().copied()
                 }
             }
-
-            if random_target || free_random {
-                // Windows' "Random country" is uniform over eligible countries,
-                // then selects that country's best server. Choosing a logical
-                // server directly would bias countries with larger fleets.
-                let countries = candidates
-                    .iter()
-                    .map(|server| server.exit_country.as_str())
-                    .collect::<BTreeSet<_>>()
-                    .into_iter()
-                    .collect::<Vec<_>>();
-                let selected_country = countries.choose(&mut rand::rng()).copied();
-                candidates.retain(|server| selected_country == Some(server.exit_country.as_str()));
-            }
-            if random_server {
-                candidates.choose(&mut rand::rng()).copied()
-            } else {
-                candidates.sort_by(|left, right| {
-                    left.score
-                        .partial_cmp(&right.score)
-                        .unwrap_or(Ordering::Equal)
-                });
-                candidates.first().copied()
-            }
-        }
-        .ok_or_else(|| {
-            NativeError::new(
-                "server_not_found",
-                "No available Proton server matches this target",
-            )
-        })?;
-
-        if secure_core && logical.features & FEATURE_SECURE_CORE == 0
-            || p2p && logical.features & FEATURE_P2P == 0
-            || tor && logical.features & FEATURE_TOR == 0
-        {
-            return Err(NativeError::new(
-                "server_feature_mismatch",
-                "Selected server does not provide the requested feature",
-            ));
-        }
-
-        let physical = logical
-            .servers
-            .iter()
-            .filter(|server| {
-                server.status == 1
-                    && !server.entry_ip.is_empty()
-                    && !server.x25519_public_key.is_empty()
-            })
-            .collect::<Vec<_>>()
-            .choose(&mut rand::rng())
-            .copied()
-            .cloned()
             .ok_or_else(|| {
-                NativeError::new(
-                    "server_not_found",
-                    "Selected Proton server has no available physical endpoint",
-                )
+                if rejected_endpoints {
+                    NativeError::new(
+                        "server_validation_failed",
+                        "No verified endpoint is available for this connection",
+                    )
+                    .retryable(true)
+                } else {
+                    NativeError::new(
+                        "server_not_found",
+                        "No available Proton server matches this target",
+                    )
+                }
             })?;
 
-        Ok(ConnectionTarget {
-            logical: logical.clone(),
-            physical,
-        })
+            if secure_core && logical.features & FEATURE_SECURE_CORE == 0
+                || p2p && logical.features & FEATURE_P2P == 0
+                || tor && logical.features & FEATURE_TOR == 0
+            {
+                return Err(NativeError::new(
+                    "server_feature_mismatch",
+                    "Selected server does not provide the requested feature",
+                ));
+            }
+
+            let physical = logical
+                .servers
+                .iter()
+                .filter(|server| server.status == 1 && validate(server).is_ok())
+                .collect::<Vec<_>>()
+                .choose(&mut rand::rng())
+                .copied()
+                .cloned();
+            let Some(physical) = physical else {
+                rejected_endpoints = true;
+                available.retain(|candidate| !std::ptr::eq(*candidate, logical));
+                if !server_name.is_empty() || available.is_empty() {
+                    return Err(NativeError::new(
+                        "server_validation_failed",
+                        "No verified endpoint is available for this connection",
+                    )
+                    .retryable(true));
+                }
+                continue;
+            };
+
+            let mut logical = logical.clone();
+            logical.state = canonical_state(&logical, &city_states).to_owned();
+            return Ok(ConnectionTarget { logical, physical });
+        }
     }
 }
 
-fn excluded_location_matches(location: &ExcludedLocation, server: &LogicalServer) -> bool {
+fn excluded_location_matches(
+    location: &ExcludedLocation,
+    server: &LogicalServer,
+    state: &str,
+) -> bool {
     if server.features & FEATURE_SECURE_CORE != 0
         && location.kind == "country"
         && server
@@ -499,9 +619,9 @@ fn excluded_location_matches(location: &ExcludedLocation, server: &LogicalServer
     }
     match location.kind.as_str() {
         "country" => true,
-        "state" => server.state.eq_ignore_ascii_case(&location.state),
+        "state" => state.eq_ignore_ascii_case(&location.state),
         "city" => {
-            (location.state.is_empty() || server.state.eq_ignore_ascii_case(&location.state))
+            (location.state.is_empty() || state.eq_ignore_ascii_case(&location.state))
                 && server.city.eq_ignore_ascii_case(&location.city)
         }
         _ => false,
@@ -640,11 +760,12 @@ fn insert_subdivision(
     subdivisions: &mut BTreeMap<String, BTreeMap<String, BTreeSet<String>>>,
     country_code: &str,
     server: &LogicalServer,
+    state: &str,
 ) {
     let cities = subdivisions
         .entry(country_code.to_owned())
         .or_default()
-        .entry(server.state.clone())
+        .entry(state.to_owned())
         .or_default();
     if !server.city.is_empty() {
         cities.insert(server.city.clone());
@@ -672,6 +793,24 @@ mod tests {
     use super::*;
     use crate::native_backend::models::{ServerLocation, FEATURE_PARTNER};
 
+    impl ServerCatalog {
+        fn select_test(
+            &self,
+            params: &Value,
+            tier: u8,
+            excluded: &[ExcludedLocation],
+            country: &str,
+        ) -> NativeResult<ConnectionTarget> {
+            self.select_validated(
+                params,
+                tier,
+                excluded,
+                country,
+                super::super::server_validation::tests::validate_test,
+            )
+        }
+    }
+
     fn logical(name: &str, country: &str, features: u32, score: f64) -> LogicalServer {
         LogicalServer {
             id: name.into(),
@@ -689,16 +828,7 @@ mod tests {
             score,
             status: 1,
             location: ServerLocation::default(),
-            servers: vec![PhysicalServer {
-                id: format!("{name}-physical"),
-                entry_ip: "192.0.2.1".into(),
-                exit_ip: "192.0.2.2".into(),
-                domain: "example.test".into(),
-                status: 1,
-                x25519_public_key: "key".into(),
-                label: String::new(),
-                extra: Default::default(),
-            }],
+            servers: vec![super::super::server_validation::tests::signed_endpoint()],
             vpn_gateway_id: None,
             gateway_name: String::new(),
             extra: Default::default(),
@@ -718,7 +848,9 @@ mod tests {
             ],
             extra: Default::default(),
         };
-        let selected = catalog.select(&json!({"target": {}}), 0, &[], "").unwrap();
+        let selected = catalog
+            .select_test(&json!({"target": {}}), 0, &[], "")
+            .unwrap();
         assert_eq!(selected.logical.name, "Standard");
     }
 
@@ -742,11 +874,11 @@ mod tests {
             city: String::new(),
         }];
         let selected = catalog
-            .select(&json!({"target": {}}), 1, &excluded, "")
+            .select_test(&json!({"target": {}}), 1, &excluded, "")
             .unwrap();
         assert_eq!(selected.logical.name, "CH");
         let explicit = catalog
-            .select(&json!({"target": {"country_code": "US"}}), 1, &excluded, "")
+            .select_test(&json!({"target": {"country_code": "US"}}), 1, &excluded, "")
             .unwrap();
         assert_eq!(explicit.logical.name, "US");
     }
@@ -769,7 +901,7 @@ mod tests {
 
         for _ in 0..64 {
             let selected = catalog
-                .select(&json!({"target": {"random": true}}), 1, &[], "")
+                .select_test(&json!({"target": {"random": true}}), 1, &[], "")
                 .unwrap();
             assert!(matches!(
                 selected.logical.name.as_str(),
@@ -795,7 +927,7 @@ mod tests {
         };
 
         let selected = catalog
-            .select(
+            .select_test(
                 &json!({"target": {
                     "country_code": "US",
                     "entry_country_code": "CH",
@@ -809,7 +941,7 @@ mod tests {
         assert_eq!(selected.logical.name, "SC-via-CH");
 
         let error = catalog
-            .select(&json!({"target": {"entry_country_code": "CH"}}), 1, &[], "")
+            .select_test(&json!({"target": {"entry_country_code": "CH"}}), 1, &[], "")
             .unwrap_err();
         assert_eq!(error.code, "invalid_params");
     }
@@ -829,7 +961,7 @@ mod tests {
         };
 
         let selected = catalog
-            .select(
+            .select_test(
                 &json!({"target": {"exclude_my_country": true}}),
                 1,
                 &[],
@@ -857,7 +989,7 @@ mod tests {
 
         for _ in 0..32 {
             let selected = catalog
-                .select(
+                .select_test(
                     &json!({"target": {
                         "country_code": "MX",
                         "random_server": true
@@ -956,5 +1088,181 @@ mod tests {
         assert_eq!(consumer_result["total"], 1);
         assert_eq!(gateway_result["total"], 1);
         assert_eq!(gateway_result["servers"][0]["name"], "ACME#1");
+    }
+    fn catalog_with(servers: Vec<LogicalServer>) -> ServerCatalog {
+        ServerCatalog {
+            expiration_time: 0.0,
+            loads_expiration_time: 0.0,
+            max_tier: 2,
+            logical_servers: servers,
+            extra: Default::default(),
+        }
+    }
+
+    #[test]
+    fn invalid_endpoints_are_skipped_without_escaping_the_requested_country() {
+        let mut bad = logical("US-bad", "US", 0, 0.0);
+        bad.servers[0].signature = None;
+        let good = logical("US-good", "US", 0, 1.0);
+        let elsewhere = logical("CH-good", "CH", 0, 2.0);
+        let catalog = catalog_with(vec![bad.clone(), good.clone(), elsewhere.clone()]);
+        assert_eq!(
+            catalog
+                .select_test(&json!({"target": {"country_code": "US"}}), 2, &[], "")
+                .unwrap()
+                .logical
+                .name,
+            "US-good"
+        );
+        assert_eq!(
+            catalog
+                .select_test(&json!({"target": {"server_name": "US-bad"}}), 2, &[], "")
+                .unwrap_err()
+                .code,
+            "server_validation_failed"
+        );
+        let catalog = catalog_with(vec![bad.clone(), elsewhere]);
+        assert_eq!(
+            catalog
+                .select_test(&json!({"target": {"country_code": "US"}}), 2, &[], "")
+                .unwrap_err()
+                .code,
+            "server_validation_failed"
+        );
+        bad.servers.push(good.servers[0].clone());
+        let catalog = catalog_with(vec![bad]);
+        assert!(catalog
+            .select_test(&json!({"target": {}}), 2, &[], "")
+            .unwrap()
+            .physical
+            .signature
+            .is_some());
+        // A synthetic signing key is never accepted by the public production selector.
+        assert!(catalog.select(&json!({"target": {}}), 2, &[], "").is_err());
+    }
+
+    #[test]
+    fn signed_catalog_round_trip_and_legacy_cache_migration() {
+        let catalog = catalog_with(vec![logical("US-good", "US", 0, 1.0)]);
+        let root =
+            std::env::temp_dir().join(format!("proton-signed-catalog-{}", uuid::Uuid::new_v4()));
+        let value = serde_json::to_value(&catalog).unwrap();
+        super::super::settings_store::save_value(&root, &value).unwrap();
+        let restored = ServerCatalog::load(&root).unwrap();
+        std::fs::remove_file(root).unwrap();
+        assert!(restored.has_endpoint_signatures());
+        restored
+            .select_test(&json!({"target": {}}), 2, &[], "")
+            .unwrap();
+        let mut legacy = value;
+        legacy["LogicalServers"][0]["Servers"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("Signature");
+        let mut legacy: ServerCatalog = serde_json::from_value(legacy).unwrap();
+        assert!(!legacy.has_endpoint_signatures());
+        legacy
+            .logical_servers
+            .push(logical("US-signed-lookup", "US", 0, 2.0));
+        assert!(
+            !legacy.has_endpoint_signatures(),
+            "one signed lookup cannot mark an unsigned cache as migrated"
+        );
+        legacy.logical_servers.pop();
+        assert!(legacy
+            .select_test(&json!({"target": {}}), 2, &[], "")
+            .is_err());
+    }
+
+    #[test]
+    fn cities_infer_only_unambiguous_states_for_lists_profiles_and_exclusions() {
+        let mut known = logical("US-known", "US", FEATURE_P2P, 1.0);
+        known.city = "Los Angeles".into();
+        known.state = "California".into();
+        known.tier = 1;
+        let mut missing = known.clone();
+        missing.name = "US-missing".into();
+        missing.state.clear();
+        missing.score = 0.0;
+        let catalog = catalog_with(vec![known.clone(), missing.clone()]);
+        let locations = catalog.locations(2);
+        let country = &locations["countries"][0];
+        for prefix in ["", "p2p_"] {
+            assert_eq!(country[format!("{prefix}cities")], json!([]));
+            assert_eq!(
+                country[format!("{prefix}states")],
+                json!([{"name": "California", "cities": ["Los Angeles"]}])
+            );
+        }
+        let target =
+            json!({"target": {"country_code": "US", "state": "California", "city": "Los Angeles"}});
+        let selected = catalog.select_test(&target, 2, &[], "").unwrap();
+        assert_eq!(selected.logical.name, "US-missing");
+        assert_eq!(selected.logical.state, "California");
+        let page = catalog.servers_page(&json!({}), 2).unwrap();
+        assert!(page["servers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|s| s["state"] == "California"));
+        let excluded = ExcludedLocation {
+            kind: "state".into(),
+            country_code: "US".into(),
+            state: "California".into(),
+            city: String::new(),
+        };
+        assert!(catalog
+            .select_test(&json!({"target": {}}), 2, &[excluded], "")
+            .is_err());
+        let mut ambiguous = known.clone();
+        ambiguous.name = "US-other".into();
+        ambiguous.state = "Other state".into();
+        let catalog = catalog_with(vec![known, missing, ambiguous]);
+        let locations = catalog.locations(2);
+        assert_eq!(
+            locations["countries"][0]["states"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(locations["countries"][0]["cities"], json!(["Los Angeles"]));
+        assert_eq!(
+            catalog
+                .select_test(&target, 2, &[], "")
+                .unwrap()
+                .logical
+                .name,
+            "US-known"
+        );
+    }
+
+    #[test]
+    fn smart_routing_retains_physical_countries_and_ignores_empty_values() {
+        let mut server = logical("AR#1", "AR", 0, 1.0);
+        server.host_country = Some("US".into());
+        let serialized = server.serialized();
+        assert_eq!(serialized["host_country_code"], "US");
+        assert_eq!(serialized["country_code"], "AR");
+        assert_eq!(serialized["smart_routing"], true);
+        let mut second = server.clone();
+        second.host_country = Some("CL".into());
+        let catalog = catalog_with(vec![server.clone(), server.clone(), second]);
+        let locations = catalog.locations(2);
+        let hosts = locations["countries"][0]["smart_routing_countries"]
+            .as_array()
+            .unwrap();
+        assert_eq!(
+            hosts
+                .iter()
+                .map(|h| h["code"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["CL", "US"]
+        );
+        for host in [None, Some("".into()), Some("  ".into())] {
+            server.host_country = host;
+            assert_eq!(server.serialized()["smart_routing"], false);
+            assert!(server.serialized()["host_country_code"].is_null());
+        }
     }
 }
