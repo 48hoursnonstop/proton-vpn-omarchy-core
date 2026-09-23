@@ -117,7 +117,7 @@ pub async fn start(
         timeout_in_seconds: LOCAL_AGENT_TIMEOUT_SECONDS,
     })
     .await
-    .map_err(agent_error)?;
+    .map_err(connect_error)?;
 
     if let Some(features) = features {
         listener
@@ -210,9 +210,36 @@ fn agent_error(error: impl std::fmt::Display) -> NativeError {
     .retryable(true)
 }
 
+fn connect_error(error: local_agent_rs::Error) -> NativeError {
+    if matches!(error, local_agent_rs::Error::TokioElapsed(_)) {
+        NativeError::new(
+            "local_agent_connect_timeout",
+            "The VPN tunnel has not made the Proton Local Agent reachable yet",
+        )
+        .retryable(true)
+    } else {
+        agent_error(error)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn only_connection_timeouts_allow_waiting_for_the_tunnel() {
+        let elapsed = tokio::time::timeout(std::time::Duration::ZERO, std::future::pending::<()>())
+            .await
+            .unwrap_err();
+        assert_eq!(
+            connect_error(local_agent_rs::Error::TokioElapsed(elapsed)).code,
+            "local_agent_connect_timeout"
+        );
+        assert_eq!(
+            connect_error(local_agent_rs::Error::ExpiredCertificate("test".into())).code,
+            "local_agent_failed"
+        );
+    }
 
     #[test]
     fn feature_mapping_matches_official_linux_client() {

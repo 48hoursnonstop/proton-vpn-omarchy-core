@@ -2190,10 +2190,26 @@ impl NativeRuntime {
     }
 
     async fn connection_connect(self: &Arc<Self>, params: Value) -> NativeResult<Value> {
-        self.refresh_certificate_if_needed().await?;
-        self.ensure_signed_catalog().await?;
+        let attempt = self.connection_attempt.fetch_add(1, Ordering::SeqCst) + 1;
+        // Token refresh must finish persisting rotated credentials even if the
+        // user cancels the tunnel. Detach only this preparation work; it cannot
+        // create a tunnel or change NetworkManager configuration.
+        let runtime = Arc::clone(self);
+        let preparation = tokio::spawn(async move {
+            runtime.refresh_certificate_if_needed().await?;
+            runtime.ensure_signed_catalog().await
+        });
+        tokio::select! {
+            biased;
+            error = self.wait_for_connection_cancel(attempt) => return Err(error),
+            prepared = preparation => prepared.map_err(join_error)??,
+        }
         let profile_id = connection_profile_id(&params)?;
-        let _network_guard = self.network_write.lock().await;
+        let _network_guard = tokio::select! {
+            biased;
+            error = self.wait_for_connection_cancel(attempt) => return Err(error),
+            guard = self.network_write.lock() => guard,
+        };
         let (session, tier) = self.require_session().await?;
         self.state.write().await.pending_connection_trigger = connection_trigger(&params).into();
         self.events
@@ -2227,6 +2243,7 @@ impl NativeRuntime {
         };
 
         let current = self.observe_blocking().await?;
+        self.check_connection_attempt(attempt)?;
         let owned_uuid = self.owned_connection_uuid.lock().await.clone();
         if let Some(uuid) = replacement_connection_uuid(&current, owned_uuid.as_deref())? {
             // Profile, recent and location selection are replacement actions in
@@ -2261,7 +2278,10 @@ impl NativeRuntime {
         .map_err(join_error)?;
         self.apply_connection_destination_policy(&global_settings, &settings)
             .await?;
-        let attempt = self.connection_attempt.fetch_add(1, Ordering::SeqCst) + 1;
+        if let Err(error) = self.check_connection_attempt(attempt) {
+            self.restore_global_destination_policy().await?;
+            return Err(error);
+        }
         self.events
             .stage("connection.connect", "tunnel.connecting", true);
         self.events.emit(
@@ -2366,22 +2386,37 @@ impl NativeRuntime {
                         .stage("connection.connect", "tunnel.securing_session", true);
                     let requested =
                         (tier > 0).then(|| connection_agent_features(&settings, &target, tier));
-                    let (agent, mut updates) =
-                        match local_agent::start(&target.logical.domain, &session, requested).await
+                    let started = tokio::select! {
+                        biased;
+                        error = self.wait_for_connection_cancel(attempt) => Err(error),
+                        started = tokio::time::timeout_at(deadline.into(), local_agent::start(&target.logical.domain, &session, requested)) => {
+                            started.unwrap_or_else(|_| Err(NativeError::new("connection_timeout", "VPN connection timed out before the tunnel became ready").retryable(true)))
+                        },
+                    };
+                    let (agent, mut updates) = match started {
+                        Ok(agent) => agent,
+                        // ProTun can report the interface as activated before
+                        // its encrypted transport works. Keep its handshake
+                        // running within the connection deadline; a 10-second
+                        // Local Agent socket timeout must not tear it down.
+                        Err(error)
+                            if error.code == "local_agent_connect_timeout"
+                                && Instant::now() < deadline =>
                         {
-                            Ok(agent) => agent,
-                            Err(error) => {
-                                self.cleanup_owned_connection(profile.uuid()).await;
-                                return Err(error);
-                            }
-                        };
+                            continue
+                        }
+                        Err(error) => {
+                            self.cleanup_owned_connection(profile.uuid()).await;
+                            return Err(error);
+                        }
+                    };
                     *self.local_agent.lock().await = Some(agent);
-                    let ready = match tokio::time::timeout(
-                        LOCAL_AGENT_READY_TIMEOUT,
-                        wait_for_local_agent_ready(&mut updates),
-                    )
-                    .await
-                    {
+                    let readiness = tokio::select! {
+                        biased;
+                        error = self.wait_for_connection_cancel(attempt) => Ok(Err(error)),
+                        result = tokio::time::timeout(LOCAL_AGENT_READY_TIMEOUT, wait_for_local_agent_ready(&mut updates)) => result,
+                    };
+                    let ready = match readiness {
                         Ok(Ok(snapshot)) => snapshot,
                         Ok(Err(error)) => {
                             self.cleanup_owned_connection(profile.uuid()).await;
@@ -2455,15 +2490,43 @@ impl NativeRuntime {
     }
 
     async fn connection_cancel(&self) -> NativeResult<Value> {
-        self.connection_attempt.fetch_add(1, Ordering::SeqCst);
+        let cancelled_generation = self.connection_attempt.fetch_add(1, Ordering::SeqCst) + 1;
         self.events
             .stage("connection.connect", "tunnel.cancelling", false);
+        // Let the attempt finish any in-flight blocking activation and clean
+        // its owned tunnel before acknowledging cancellation. Never race two
+        // NetworkManager mutations or leave a late activation behind.
+        let _network_guard = self.network_write.lock().await;
+        if self.connection_attempt.load(Ordering::SeqCst) != cancelled_generation {
+            // Another client has already started a newer attempt. Its tunnel
+            // is outside the scope of this cancellation request.
+            return Ok(json!({ "accepted": true }));
+        }
         let owned_uuid = self.owned_connection_uuid.lock().await.clone();
-        let Some(owned_uuid) = owned_uuid else {
-            return Ok(json!({ "accepted": false, "reason": "no_native_attempt" }));
-        };
-        self.disconnect_owned_inner(&owned_uuid).await?;
+        if let Some(owned_uuid) = owned_uuid {
+            self.disconnect_owned_inner(&owned_uuid).await?;
+        }
         Ok(json!({ "accepted": true }))
+    }
+
+    fn check_connection_attempt(&self, attempt: u64) -> NativeResult<()> {
+        if self.connection_attempt.load(Ordering::SeqCst) == attempt {
+            Ok(())
+        } else {
+            Err(NativeError::new(
+                "connection_cancelled",
+                "VPN connection attempt was cancelled",
+            ))
+        }
+    }
+
+    async fn wait_for_connection_cancel(&self, attempt: u64) -> NativeError {
+        loop {
+            if let Err(error) = self.check_connection_attempt(attempt) {
+                return error;
+            }
+            tokio::time::sleep(CONNECTION_POLL_INTERVAL).await;
+        }
     }
 
     async fn connection_disconnect(&self) -> NativeResult<Value> {
