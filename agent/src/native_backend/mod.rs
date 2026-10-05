@@ -61,8 +61,39 @@ const ACCOUNT_URL: &str = "https://account.protonvpn.com/account";
 const SIGNUP_URL: &str = "https://account.protonvpn.com/signup";
 const AUTO_LOGIN_BASE_URL: &str = "https://account.proton.me/lite";
 const UPGRADE_CHILD_CLIENT_ID: &str = "web-account-lite";
+/// Proton's in-tunnel gateway. The Local Agent control channel, NAT-PMP port
+/// forwarding and the tunnel itself all live at 10.2.0.1; routing it past the
+/// tunnel blackholes the control plane (the Local Agent handshake times out
+/// and the backend reports `local_agent_failed`). It must never be bypassed.
 const LAN_BYPASS_RANGES: &[&str] = &[
-    "10.0.0.0/8",
+    // 10.0.0.0/8 with the tunnel gateway carved out: bypassing 10.2.0.1 sends
+    // the Local Agent channel out the physical interface, where it can never
+    // answer, so every connect fails while Allow LAN is on. The 24 prefixes
+    // below cover 10.0.0.0/8 except 10.2.0.1/32.
+    "10.128.0.0/9",
+    "10.64.0.0/10",
+    "10.32.0.0/11",
+    "10.16.0.0/12",
+    "10.8.0.0/13",
+    "10.4.0.0/14",
+    "10.0.0.0/15",
+    "10.3.0.0/16",
+    "10.2.128.0/17",
+    "10.2.64.0/18",
+    "10.2.32.0/19",
+    "10.2.16.0/20",
+    "10.2.8.0/21",
+    "10.2.4.0/22",
+    "10.2.2.0/23",
+    "10.2.1.0/24",
+    "10.2.0.128/25",
+    "10.2.0.64/26",
+    "10.2.0.32/27",
+    "10.2.0.16/28",
+    "10.2.0.8/29",
+    "10.2.0.4/30",
+    "10.2.0.2/31",
+    "10.2.0.0/32",
     "172.16.0.0/12",
     "192.168.0.0/16",
     "169.254.0.0/16",
@@ -4263,5 +4294,44 @@ mod tests {
             optional_profile_policy(policies, "allow_local_dns").unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn lan_bypass_ranges_never_cover_the_tunnel_gateway() {
+        use ipnet::{IpNet, Ipv4Net};
+        use std::net::Ipv4Addr;
+        use std::str::FromStr;
+
+        // Proton's in-tunnel gateway: Local Agent, NAT-PMP and the tunnel
+        // itself. Must stay reachable through the tunnel (see LAN_BYPASS_RANGES).
+        let gateway = std::net::IpAddr::from_str("10.2.0.1").unwrap();
+        let lan_supernet = Ipv4Net::new(Ipv4Addr::new(10, 0, 0, 0), 8).unwrap();
+        let mut kept_inside_lan: u128 = 0;
+        for range in LAN_BYPASS_RANGES
+            .iter()
+            .chain(LOCAL_NAME_BYPASS_RANGES.iter())
+        {
+            let network = IpNet::from_str(range)
+                .unwrap_or_else(|_| panic!("bypass range must parse as CIDR: {range}"));
+            // splitd truncates to the network address on ingest, so assert the
+            // constants are already canonical.
+            assert_eq!(
+                network.to_string(),
+                network.trunc().to_string(),
+                "bypass range must be canonical: {range}"
+            );
+            assert!(
+                !network.contains(&gateway),
+                "bypass range {range} would divert the tunnel gateway past the VPN"
+            );
+            if let IpNet::V4(net) = network {
+                if lan_supernet.contains(&net.addr()) {
+                    kept_inside_lan += 1u128 << (32 - network.prefix_len());
+                }
+            }
+        }
+        // The 10/8 carve-out must not shrink LAN coverage: every address in
+        // 10.0.0.0/8 except the gateway itself must still bypass.
+        assert_eq!(kept_inside_lan, (1u128 << 24) - 1);
     }
 }
