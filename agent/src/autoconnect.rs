@@ -251,7 +251,7 @@ mod tests {
             let store = StoreHandle::open(
                 root.join("state.json"),
                 &root.join("legacy.json"),
-                root.join("lifecycle.json"),
+                root.join("config/proton-vpn-omarchy/lifecycle.json"),
                 state.clone(),
                 operations.clone(),
             )

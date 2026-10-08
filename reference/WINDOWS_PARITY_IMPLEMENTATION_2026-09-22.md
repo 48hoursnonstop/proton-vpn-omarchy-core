@@ -1,7 +1,7 @@
 # Windows 5.1.8 parity — implementation checkpoint
 
 This historical checkpoint is superseded for release validation by
-[the 0.9.8 report](RELEASE_0.9.8_2026-10-08.md), which includes the production
+[the 0.9.9 report](RELEASE_0.9.9_2026-10-08.md), which includes the production
 signed-catalog fixture and subsequent connection fixes.
 
 Branch: `feat/windows-5.1.8-parity`, based on core 0.9.7. This is an

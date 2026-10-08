@@ -1,9 +1,15 @@
-# 0.9.8 release validation — 2026-10-08
+# 0.9.9 release validation — 2026-10-08
 
 This release combines the reviewed LAN/startup corrections from PR #2 with
 the three commits previously used by the local Windows 5.1.8 parity preview.
 The historical parity checkpoint remains in
 [WINDOWS_PARITY_IMPLEMENTATION_2026-09-22.md](WINDOWS_PARITY_IMPLEMENTATION_2026-09-22.md).
+
+The first CI build under tag 0.9.8 exposed an auto-connect fixture whose
+lifecycle path placed autostart links in a shared temporary directory.
+The fixture now uses its own config/proton-vpn-omarchy directory. The parallel
+workspace suite and all eight auto-connect tests pass with that isolation.
+No 0.9.8 release was published; the failed tag is retained for traceability.
 
 ## Verification
 
