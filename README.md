@@ -56,9 +56,10 @@ recipe and uses the tracked `packaging/release/SOURCE_DATE_EPOCH`.
 
 Use the guided, signature-verifying installer in the [Omarchy plugin][plugin].
 It installs the matching package and configures systemd socket activation.
-Manual package downloads are available from the [0.9.7 release][release].
-The stable Arch package is `0.9.7-2`, which upgrades the `0.9.7-1` candidate
-without changing the RC1 keyring format or requiring another sign-in.
+Manual package downloads are available from the [0.9.8 release][release].
+The stable Arch package is `0.9.8-1`. It includes startup retries that respect
+cancellation, the LAN tunnel-gateway fix, and the previously previewed server
+validation and connection improvements. The RC1 keyring format is unchanged.
 
 ## GNOME Keyring compatibility
 
@@ -154,4 +155,4 @@ Original project code is GPL-3.0-or-later. Vendored and upstream-derived files
 retain their own notices and license files; see `NOTICE.md`.
 
 [plugin]: https://github.com/48hoursnonstop/proton-vpn-omarchy
-[release]: https://github.com/48hoursnonstop/proton-vpn-omarchy-core/releases/tag/v0.9.7
+[release]: https://github.com/48hoursnonstop/proton-vpn-omarchy-core/releases/tag/v0.9.8
