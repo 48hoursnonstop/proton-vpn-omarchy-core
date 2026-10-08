@@ -18,6 +18,10 @@ use std::{
 use x509_parser::parse_x509_certificate;
 use zeroize::Zeroizing;
 
+mod tls;
+
+pub const SIGNED_CATALOG_ENDPOINT: &str =
+    "/vpn/v1/logicals?SecureCoreFilter=all&WithState=true&SignServer=Server.EntryIP,Server.Label";
 const API_BASE: &str = "https://vpn-api.proton.me";
 const API_CORE_COMPAT_VERSION: &str = "5.5.11";
 const MAX_API_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
@@ -35,7 +39,7 @@ const ALTERNATIVE_TLS_PINS: &[&str] = &[
 
 #[derive(Clone, Debug)]
 struct CachedAlternativeRoute {
-    host: String,
+    route: ApiRoute,
     expires_at: Instant,
 }
 
@@ -43,6 +47,7 @@ struct CachedAlternativeRoute {
 enum ApiRoute {
     Direct,
     Alternative(String),
+    Account,
 }
 
 impl ApiRoute {
@@ -50,12 +55,13 @@ impl ApiRoute {
         match self {
             Self::Direct => format!("{API_BASE}{endpoint}"),
             Self::Alternative(host) => format!("https://{host}{endpoint}"),
+            Self::Account => format!("https://account.proton.me/api{endpoint}"),
         }
     }
 
     fn pins(&self) -> &'static [&'static str] {
         match self {
-            Self::Direct => TLS_PINS,
+            Self::Direct | Self::Account => TLS_PINS,
             Self::Alternative(_) => ALTERNATIVE_TLS_PINS,
         }
     }
@@ -68,6 +74,7 @@ impl ApiRoute {
         match self {
             Self::Direct => "direct",
             Self::Alternative(_) => "alternative",
+            Self::Account => "account",
         }
     }
 }
@@ -124,9 +131,8 @@ impl ProtonApi {
         let client = build_api_client(headers.clone(), Arc::clone(&cookie_jar), false)?;
         // Proton's alternative hosts intentionally use certificates whose DNS
         // names do not match their IP-valued TXT records. The official clients
-        // therefore authenticate these endpoints solely with the dedicated
-        // alternative-routing SPKI pins. This client is never used for direct
-        // API traffic and every response is pin-checked before its body is read.
+        // therefore authenticate these endpoints with dedicated SPKI pins.
+        // Enforce those pins during TLS, before sending any HTTP credentials.
         let alternative_client = build_api_client(headers, cookie_jar, true)?;
         Ok(Self {
             client,
@@ -344,7 +350,12 @@ impl ProtonApi {
         let encoded_name =
             url::form_urlencoded::byte_serialize(name.as_bytes()).collect::<String>();
         let payload = self
-            .get(&format!("/vpn/v1/logicals/lookup/{encoded_name}"), session)
+            .get(
+                &format!(
+                    "/vpn/v1/logicals/lookup/{encoded_name}?SignServer=Server.EntryIP,Server.Label"
+                ),
+                session,
+            )
             .await?;
         payload
             .get("LogicalServer")
@@ -593,9 +604,7 @@ impl ProtonApi {
         }
         let mut cached = self.alternative_route.lock().await;
         match cached.as_ref() {
-            Some(route) if route.expires_at > Instant::now() => {
-                ApiRoute::Alternative(route.host.clone())
-            }
+            Some(route) if route.expires_at > Instant::now() => route.route.clone(),
             Some(_) => {
                 *cached = None;
                 ApiRoute::Direct
@@ -606,7 +615,7 @@ impl ProtonApi {
 
     fn client_for_route(&self, route: &ApiRoute) -> &reqwest::Client {
         match route {
-            ApiRoute::Direct => &self.client,
+            ApiRoute::Direct | ApiRoute::Account => &self.client,
             ApiRoute::Alternative(_) => &self.alternative_client,
         }
     }
@@ -616,20 +625,33 @@ impl ProtonApi {
         current: &ApiRoute,
         tried_alternative: bool,
     ) -> Option<ApiRoute> {
-        if current.is_alternative() {
-            *self.alternative_route.lock().await = None;
-            return Some(ApiRoute::Direct);
-        }
-        if tried_alternative || !self.alternative_routing_enabled.load(Ordering::Acquire) {
+        if !self.alternative_routing_enabled.load(Ordering::Acquire) {
             return None;
         }
-        let AlternativeRoute { host, valid_for } = alternative_routing::resolve().await.ok()?;
-        let cached = CachedAlternativeRoute {
-            host: host.clone(),
-            expires_at: Instant::now() + valid_for,
-        };
-        *self.alternative_route.lock().await = Some(cached);
-        Some(ApiRoute::Alternative(host))
+        if matches!(current, ApiRoute::Account) {
+            *self.alternative_route.lock().await = None;
+            return None;
+        }
+        if !current.is_alternative() && !tried_alternative {
+            if let Ok(AlternativeRoute { host, valid_for }) = alternative_routing::resolve().await {
+                let route = ApiRoute::Alternative(host);
+                *self.alternative_route.lock().await = Some(CachedAlternativeRoute {
+                    route: route.clone(),
+                    expires_at: Instant::now() + valid_for,
+                });
+                return Some(route);
+            }
+        }
+        // Proton's account origin also serves the VPN API. Some networks block
+        // the VPN origin and intercept the IP routes while allowing this host.
+        // Keep normal PKI/hostname validation AND the direct API's SPKI pins.
+        // This fixed origin is the last fallback; never follow redirects or
+        // accept a caller-supplied host for authenticated requests.
+        *self.alternative_route.lock().await = Some(CachedAlternativeRoute {
+            route: ApiRoute::Account,
+            expires_at: Instant::now() + Duration::from_secs(120),
+        });
+        Some(ApiRoute::Account)
     }
 
     async fn solve_human_verification(&self, challenge: &str) -> NativeResult<String> {
@@ -664,7 +686,7 @@ fn build_api_client(
         .cookie_provider(cookie_jar)
         .tls_info(true)
         .redirect(reqwest::redirect::Policy::none())
-        .danger_accept_invalid_certs(accept_pinned_name_mismatch)
+        .use_preconfigured_tls(tls::config(accept_pinned_name_mismatch)?)
         .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(30))
         .build()
@@ -751,6 +773,7 @@ async fn decode_api_response(
 }
 
 fn response_body_limit(path: &str) -> usize {
+    let path = path.strip_prefix("/api").unwrap_or(path);
     // Account bootstrap and both generations of the logical-server catalog
     // are the only API responses expected to grow with Proton's fleet. Keep
     // the larger budget narrowly scoped so authentication, support and other
@@ -930,6 +953,55 @@ fn invalid_api_response(field: &str) -> NativeError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn account_fallback_keeps_primary_pins_and_a_fixed_https_origin() {
+        let route = ApiRoute::Account;
+        assert_eq!(
+            route.url("/auth/refresh"),
+            "https://account.proton.me/api/auth/refresh"
+        );
+        assert_eq!(route.pins(), TLS_PINS);
+        assert!(!route.is_alternative());
+        assert_eq!(
+            response_body_limit("/api/vpn/v1/logicals"),
+            MAX_SERVER_CATALOG_BYTES
+        );
+        assert_eq!(
+            response_body_limit("/api/auth/refresh"),
+            MAX_API_RESPONSE_BYTES
+        );
+        assert_eq!(
+            response_body_limit("/api/vpn/v1/logicals/anything"),
+            MAX_API_RESPONSE_BYTES
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "contacts the official Proton account API without credentials"]
+    async fn live_account_fallback_is_pinned_vpn_json() {
+        let route = ApiRoute::Account;
+        let mut headers = header::HeaderMap::new();
+        headers.insert(
+            "x-pm-appversion",
+            header::HeaderValue::from_static("linux-vpn-gui@5.5.11+x86_64"),
+        );
+        let client = build_api_client(headers, Arc::new(Jar::default()), false).unwrap();
+        let response = client
+            .get(route.url("/vpn/v2/clientconfig"))
+            .send()
+            .await
+            .unwrap();
+        validate_tls_pin(&response, route.pins()).unwrap();
+        let (status, _, payload) = decode_api_response(response, &route).await.unwrap();
+        assert!(
+            status.is_success(),
+            "HTTP {} / API code {}",
+            status,
+            payload["Code"]
+        );
+        assert_eq!(payload["Code"], 1000);
+    }
 
     #[test]
     fn only_the_server_catalog_gets_the_large_response_budget() {

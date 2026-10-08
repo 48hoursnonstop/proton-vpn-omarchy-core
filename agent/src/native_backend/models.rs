@@ -185,7 +185,9 @@ pub struct PhysicalServer {
     #[serde(rename = "X25519PublicKey", default)]
     pub x25519_public_key: String,
     #[serde(default)]
-    pub label: String,
+    pub label: Option<String>,
+    #[serde(default)]
+    pub signature: Option<String>,
     #[serde(flatten)]
     pub extra: serde_json::Map<String, Value>,
 }
@@ -214,6 +216,13 @@ impl LogicalServer {
         }
     }
 
+    pub fn host_country_code(&self) -> Option<&str> {
+        self.host_country
+            .as_deref()
+            .map(str::trim)
+            .filter(|code| !code.is_empty())
+    }
+
     pub fn serialized(&self) -> Value {
         json!({
             "id": self.id,
@@ -237,7 +246,9 @@ impl LogicalServer {
             "ipv6": self.features & FEATURE_IPV6 != 0,
             "restricted": self.features & FEATURE_B2B != 0,
             "partner": self.features & FEATURE_PARTNER != 0,
-            "smart_routing": self.host_country.is_some(),
+            "smart_routing": self.host_country_code().is_some(),
+            "host_country_code": self.host_country_code(),
+            "host_country_name": self.host_country_code().map(country_name),
             "gateway_name": self.gateway_name(),
         })
     }

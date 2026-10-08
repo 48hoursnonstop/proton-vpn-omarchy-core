@@ -228,6 +228,12 @@ pub(crate) fn apply_event(
                             .get("viewed")
                             .and_then(Value::as_bool)
                             .unwrap_or(false);
+                        state.features.connection_feedback.auto_dismiss_seconds =
+                            connection_feedback
+                                .get("auto_dismiss_seconds")
+                                .and_then(Value::as_u64)
+                                .filter(|seconds| (1..=300).contains(seconds))
+                                .unwrap_or(10) as u32;
                         state.features.connection_feedback.sent = connection_feedback
                             .get("sent")
                             .and_then(Value::as_bool)
@@ -464,6 +470,8 @@ pub(crate) fn apply_event(
                     .and_then(|s| s.get("country_name"))
                     .and_then(Value::as_str)
                     .map(str::to_owned);
+                state.connection.host_country_code = server_string(server, "host_country_code");
+                state.connection.host_country_name = server_string(server, "host_country_name");
                 state.connection.entry_country_code = secure_core
                     .then(|| server_string(server, "entry_country_code"))
                     .flatten();
@@ -607,5 +615,84 @@ mod tests {
 
         assert_eq!(standard_entry, None);
         assert_eq!(secure_core_entry.as_deref(), Some("MX"));
+    }
+    #[test]
+    fn smart_routing_and_feedback_survive_ipc_and_clear_on_disconnect() {
+        let root = std::env::temp_dir().join(format!("proton-ipc-parity-{}", uuid::Uuid::new_v4()));
+        let (tx, rx) = watch::channel(StateSnapshot::default());
+        let operations = OperationCoordinator::new(tx.clone());
+        let store = StoreHandle::open(
+            root.join("state.json"),
+            &root.join("legacy.json"),
+            root.join("config/proton-vpn-omarchy/lifecycle.json"),
+            tx.clone(),
+            operations.clone(),
+        )
+        .unwrap();
+        apply_event(
+            &tx,
+            &operations,
+            &store,
+            "connection",
+            json!({
+                "status": "connected", "secure_core": true, "server": {
+                    "country_code": "AR", "host_country_code": "US", "host_country_name": "United States",
+                    "entry_country_code": "CH", "entry_country_name": "Switzerland"
+                }
+            }),
+        );
+        let state = rx.borrow().clone();
+        assert_eq!(state.connection.country_code.as_deref(), Some("AR"));
+        assert_eq!(state.connection.host_country_code.as_deref(), Some("US"));
+        assert_eq!(state.connection.entry_country_code.as_deref(), Some("CH"));
+        let roundtrip: StateSnapshot =
+            serde_json::from_value(serde_json::to_value(&state).unwrap()).unwrap();
+        assert_eq!(
+            roundtrip.connection.host_country_name.as_deref(),
+            Some("United States")
+        );
+        apply_event(
+            &tx,
+            &operations,
+            &store,
+            "connection",
+            json!({"status": "disconnected", "server": null}),
+        );
+        assert!(rx.borrow().connection.host_country_code.is_none());
+        assert!(rx.borrow().connection.host_country_name.is_none());
+        apply_event(
+            &tx,
+            &operations,
+            &store,
+            "features",
+            json!({"known": true, "connection_feedback": {
+                "available": true, "viewed": false, "sent": false, "auto_dismiss_seconds": 15
+            }}),
+        );
+        assert_eq!(
+            rx.borrow()
+                .features
+                .connection_feedback
+                .auto_dismiss_seconds,
+            15
+        );
+        apply_event(
+            &tx,
+            &operations,
+            &store,
+            "features",
+            json!({"known": true, "connection_feedback": {
+                "available": false, "viewed": true, "sent": false, "auto_dismiss_seconds": 9999
+            }}),
+        );
+        assert_eq!(
+            rx.borrow()
+                .features
+                .connection_feedback
+                .auto_dismiss_seconds,
+            10
+        );
+        assert!(!rx.borrow().features.connection_feedback.sent);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

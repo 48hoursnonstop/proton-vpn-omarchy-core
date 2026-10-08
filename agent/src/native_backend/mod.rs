@@ -8,6 +8,7 @@ mod local_agent;
 mod models;
 mod network;
 mod secret_store;
+mod server_validation;
 mod session_bootstrap;
 mod settings_store;
 mod split_tunnel;
@@ -243,6 +244,7 @@ struct RuntimeState {
     selected: Option<ConnectionTarget>,
     traffic: Option<TrafficSample>,
     connection_feedback_feature_enabled: bool,
+    connection_feedback_auto_dismiss_seconds: u32,
     feedback_session: Option<telemetry::ConnectionFeedbackSession>,
     pending_connection_trigger: String,
 }
@@ -1087,17 +1089,24 @@ impl NativeRuntime {
             .session
             .as_ref()
             .map(session_bootstrap::stored_api_session);
-        let enabled = match api_session {
+        let config = match api_session {
             Some(api_session) => self
                 .api
                 .get("/feature/v2/frontend", &api_session)
                 .await
-                .ok()
-                .map(|value| feature_flag_enabled(&value, "IsConnectionFeedbackEnabled"))
-                .unwrap_or(false),
-            None => false,
+                .ok(),
+            None => None,
         };
-        self.state.write().await.connection_feedback_feature_enabled = enabled;
+        {
+            let mut state = self.state.write().await;
+            state.connection_feedback_feature_enabled = config
+                .as_ref()
+                .is_some_and(|value| feature_flag_enabled(value, "IsConnectionFeedbackEnabled"));
+            state.connection_feedback_auto_dismiss_seconds = config
+                .as_ref()
+                .map(feedback_auto_dismiss_seconds)
+                .unwrap_or(10);
+        }
         self.emit_features().await;
     }
 
@@ -1300,7 +1309,10 @@ impl NativeRuntime {
         let feedback_available = signed_in
             && settings.share_statistics
             && state.connection_feedback_feature_enabled
-            && state.feedback_session.is_some()
+            && state
+                .feedback_session
+                .as_ref()
+                .is_some_and(|feedback| !feedback.dismissed())
             && !feedback_sent;
         let data = json!({
             "protocol": {
@@ -1325,6 +1337,7 @@ impl NativeRuntime {
                 "available": feedback_available,
                 "viewed": feedback_viewed,
                 "sent": feedback_sent,
+                "auto_dismiss_seconds": state.connection_feedback_auto_dismiss_seconds,
             },
             "moderate_nat": { "enabled": settings.features.moderate_nat },
             "ipv6": { "enabled": settings.ipv6 },
@@ -2090,6 +2103,43 @@ impl NativeRuntime {
         Ok(())
     }
 
+    async fn ensure_signed_catalog(&self) -> NativeResult<()> {
+        let _auth = self.auth_write.lock().await;
+        let (mut stored, tier) = self.require_session().await?;
+        let now = unix_seconds()? as f64;
+        let cached = self.state.read().await.catalog.as_ref().map(|catalog| {
+            (
+                catalog.has_endpoint_signatures(),
+                catalog.expiration_time > now,
+            )
+        });
+        if cached == Some((true, true)) {
+            return Ok(());
+        }
+        let mut auth = session_bootstrap::stored_api_session(&stored);
+        let fetched = session_bootstrap::fetch_catalog(&self.api, &auth, tier).await;
+        // A verified cached endpoint is still usable when catalog refresh is
+        // unavailable. Selection and the tunnel boundary both check its signature.
+        let (catalog, value) = match fetched {
+            Err(_) if cached.is_some_and(|(signed, _)| signed) => return Ok(()),
+            Err(error) if error.code == "authentication_expired" => {
+                self.api.refresh(&mut auth).await?;
+                stored.access_token = auth.access_token.clone();
+                stored.refresh_token = auth.refresh_token.clone();
+                stored.scopes = auth.scopes.clone();
+                self.persist_session_data(stored).await?;
+                session_bootstrap::fetch_catalog(&self.api, &auth, tier).await?
+            }
+            result => result?,
+        };
+        let path = self.paths.catalog.clone();
+        tokio::task::spawn_blocking(move || settings_store::save_value(&path, &value))
+            .await
+            .map_err(join_error)??;
+        self.state.write().await.catalog = Some(catalog);
+        Ok(())
+    }
+
     async fn locations(&self) -> NativeResult<Value> {
         let (_, tier) = self.require_session().await?;
         let state = self.state.read().await;
@@ -2171,27 +2221,27 @@ impl NativeRuntime {
     }
 
     async fn connection_connect(self: &Arc<Self>, params: Value) -> NativeResult<Value> {
-        self.refresh_certificate_if_needed().await?;
-        let profile_id = connection_profile_id(&params)?;
-        let _network_guard = self.network_write.lock().await;
-        let (session, tier) = self.require_session().await?;
-        let current = self.observe_blocking().await?;
-        let owned_uuid = self.owned_connection_uuid.lock().await.clone();
-        if let Some(uuid) = replacement_connection_uuid(&current, owned_uuid.as_deref())? {
-            // Profile, recent and location selection are replacement actions in
-            // Proton's clients. Keep them a single foreground operation while
-            // still refusing to tear down a tunnel owned by another client.
-            self.events
-                .stage("connection.connect", "tunnel.disconnecting", true);
-            self.disconnect_owned_inner(&uuid).await?;
-            if self.observe_blocking().await?.state != TunnelState::Disconnected {
-                return Err(NativeError::new(
-                    "disconnect_failed",
-                    "The active VPN connection did not stop before reconnecting",
-                )
-                .retryable(true));
-            }
+        let attempt = self.connection_attempt.fetch_add(1, Ordering::SeqCst) + 1;
+        // Token refresh must finish persisting rotated credentials even if the
+        // user cancels the tunnel. Detach only this preparation work; it cannot
+        // create a tunnel or change NetworkManager configuration.
+        let runtime = Arc::clone(self);
+        let preparation = tokio::spawn(async move {
+            runtime.refresh_certificate_if_needed().await?;
+            runtime.ensure_signed_catalog().await
+        });
+        tokio::select! {
+            biased;
+            error = self.wait_for_connection_cancel(attempt) => return Err(error),
+            prepared = preparation => prepared.map_err(join_error)??,
         }
+        let profile_id = connection_profile_id(&params)?;
+        let _network_guard = tokio::select! {
+            biased;
+            error = self.wait_for_connection_cancel(attempt) => return Err(error),
+            guard = self.network_write.lock() => guard,
+        };
+        let (session, tier) = self.require_session().await?;
         self.state.write().await.pending_connection_trigger = connection_trigger(&params).into();
         self.events
             .stage("connection.connect", "tunnel.selecting_server", true);
@@ -2223,6 +2273,24 @@ impl NativeRuntime {
             )
         };
 
+        let current = self.observe_blocking().await?;
+        self.check_connection_attempt(attempt)?;
+        let owned_uuid = self.owned_connection_uuid.lock().await.clone();
+        if let Some(uuid) = replacement_connection_uuid(&current, owned_uuid.as_deref())? {
+            // Profile, recent and location selection are replacement actions in
+            // Proton's clients. Keep them a single foreground operation while
+            // still refusing to tear down a tunnel owned by another client.
+            self.events
+                .stage("connection.connect", "tunnel.disconnecting", true);
+            self.disconnect_owned_inner(&uuid).await?;
+            if self.observe_blocking().await?.state != TunnelState::Disconnected {
+                return Err(NativeError::new(
+                    "disconnect_failed",
+                    "The active VPN connection did not stop before reconnecting",
+                )
+                .retryable(true));
+            }
+        }
         let profile = VpnProfile::new(
             &target,
             &protocol,
@@ -2241,7 +2309,10 @@ impl NativeRuntime {
         .map_err(join_error)?;
         self.apply_connection_destination_policy(&global_settings, &settings)
             .await?;
-        let attempt = self.connection_attempt.fetch_add(1, Ordering::SeqCst) + 1;
+        if let Err(error) = self.check_connection_attempt(attempt) {
+            self.restore_global_destination_policy().await?;
+            return Err(error);
+        }
         self.events
             .stage("connection.connect", "tunnel.connecting", true);
         self.events.emit(
@@ -2346,22 +2417,37 @@ impl NativeRuntime {
                         .stage("connection.connect", "tunnel.securing_session", true);
                     let requested =
                         (tier > 0).then(|| connection_agent_features(&settings, &target, tier));
-                    let (agent, mut updates) =
-                        match local_agent::start(&target.logical.domain, &session, requested).await
+                    let started = tokio::select! {
+                        biased;
+                        error = self.wait_for_connection_cancel(attempt) => Err(error),
+                        started = tokio::time::timeout_at(deadline.into(), local_agent::start(&target.logical.domain, &session, requested)) => {
+                            started.unwrap_or_else(|_| Err(NativeError::new("connection_timeout", "VPN connection timed out before the tunnel became ready").retryable(true)))
+                        },
+                    };
+                    let (agent, mut updates) = match started {
+                        Ok(agent) => agent,
+                        // ProTun can report the interface as activated before
+                        // its encrypted transport works. Keep its handshake
+                        // running within the connection deadline; a 10-second
+                        // Local Agent socket timeout must not tear it down.
+                        Err(error)
+                            if error.code == "local_agent_connect_timeout"
+                                && Instant::now() < deadline =>
                         {
-                            Ok(agent) => agent,
-                            Err(error) => {
-                                self.cleanup_owned_connection(profile.uuid()).await;
-                                return Err(error);
-                            }
-                        };
+                            continue
+                        }
+                        Err(error) => {
+                            self.cleanup_owned_connection(profile.uuid()).await;
+                            return Err(error);
+                        }
+                    };
                     *self.local_agent.lock().await = Some(agent);
-                    let ready = match tokio::time::timeout(
-                        LOCAL_AGENT_READY_TIMEOUT,
-                        wait_for_local_agent_ready(&mut updates),
-                    )
-                    .await
-                    {
+                    let readiness = tokio::select! {
+                        biased;
+                        error = self.wait_for_connection_cancel(attempt) => Ok(Err(error)),
+                        result = tokio::time::timeout(LOCAL_AGENT_READY_TIMEOUT, wait_for_local_agent_ready(&mut updates)) => result,
+                    };
+                    let ready = match readiness {
                         Ok(Ok(snapshot)) => snapshot,
                         Ok(Err(error)) => {
                             self.cleanup_owned_connection(profile.uuid()).await;
@@ -2435,15 +2521,43 @@ impl NativeRuntime {
     }
 
     async fn connection_cancel(&self) -> NativeResult<Value> {
-        self.connection_attempt.fetch_add(1, Ordering::SeqCst);
+        let cancelled_generation = self.connection_attempt.fetch_add(1, Ordering::SeqCst) + 1;
         self.events
             .stage("connection.connect", "tunnel.cancelling", false);
+        // Let the attempt finish any in-flight blocking activation and clean
+        // its owned tunnel before acknowledging cancellation. Never race two
+        // NetworkManager mutations or leave a late activation behind.
+        let _network_guard = self.network_write.lock().await;
+        if self.connection_attempt.load(Ordering::SeqCst) != cancelled_generation {
+            // Another client has already started a newer attempt. Its tunnel
+            // is outside the scope of this cancellation request.
+            return Ok(json!({ "accepted": true }));
+        }
         let owned_uuid = self.owned_connection_uuid.lock().await.clone();
-        let Some(owned_uuid) = owned_uuid else {
-            return Ok(json!({ "accepted": false, "reason": "no_native_attempt" }));
-        };
-        self.disconnect_owned_inner(&owned_uuid).await?;
+        if let Some(owned_uuid) = owned_uuid {
+            self.disconnect_owned_inner(&owned_uuid).await?;
+        }
         Ok(json!({ "accepted": true }))
+    }
+
+    fn check_connection_attempt(&self, attempt: u64) -> NativeResult<()> {
+        if self.connection_attempt.load(Ordering::SeqCst) == attempt {
+            Ok(())
+        } else {
+            Err(NativeError::new(
+                "connection_cancelled",
+                "VPN connection attempt was cancelled",
+            ))
+        }
+    }
+
+    async fn wait_for_connection_cancel(&self, attempt: u64) -> NativeError {
+        loop {
+            if let Err(error) = self.check_connection_attempt(attempt) {
+                return error;
+            }
+            tokio::time::sleep(CONNECTION_POLL_INTERVAL).await;
+        }
     }
 
     async fn connection_disconnect(&self) -> NativeResult<Value> {
@@ -2887,10 +3001,13 @@ impl NativeRuntime {
             .unwrap_or("")
             .trim()
             .to_ascii_lowercase();
-        if !matches!(value.as_str(), "viewed" | "positive" | "negative") {
+        if !matches!(
+            value.as_str(),
+            "viewed" | "positive" | "negative" | "dismissed"
+        ) {
             return Err(NativeError::new(
                 "invalid_params",
-                "Connection feedback must be viewed, positive or negative",
+                "Connection feedback must be viewed, positive, negative or dismissed",
             ));
         }
         let mut state = self.state.write().await;
@@ -2906,7 +3023,9 @@ impl NativeRuntime {
                 "Connect Proton VPN before submitting connection feedback",
             )
         })?;
-        if feedback.sent() && value != "viewed" {
+        if (feedback.sent() || feedback.dismissed())
+            && !matches!(value.as_str(), "viewed" | "dismissed")
+        {
             return Err(NativeError::new(
                 "connection_feedback_already_sent",
                 "Connection feedback was already submitted for this session",
@@ -2915,8 +3034,10 @@ impl NativeRuntime {
         feedback.update_feedback(&value);
         let sent = feedback.sent();
         drop(state);
-        self.events
-            .stage("connection.feedback", "support.feedback_recorded", false);
+        if value != "dismissed" {
+            self.events
+                .stage("connection.feedback", "support.feedback_recorded", false);
+        }
         self.emit_features().await;
         Ok(json!({ "recorded": true, "sent": sent }))
     }
@@ -3232,7 +3353,7 @@ fn connection_agent_features(
         settings.features.moderate_nat,
         settings.features.vpn_accelerator,
         settings.features.port_forwarding,
-        &target.physical.label,
+        target.physical.label.as_deref().unwrap_or(""),
     )
 }
 
@@ -3535,6 +3656,7 @@ fn load_cached_state(paths: &Paths, session: Option<SessionData>) -> RuntimeStat
         selected: None,
         traffic: None,
         connection_feedback_feature_enabled: false,
+        connection_feedback_auto_dismiss_seconds: 10,
         feedback_session: None,
         pending_connection_trigger: "connection_card".into(),
     }
@@ -3659,7 +3781,7 @@ fn connection_trigger(params: &Value) -> &'static str {
     }
 }
 
-fn feature_flag_enabled(payload: &Value, name: &str) -> bool {
+fn feature_flag<'a>(payload: &'a Value, name: &str) -> Option<&'a Value> {
     payload
         .get("toggles")
         .or_else(|| payload.get("Toggles"))
@@ -3673,9 +3795,24 @@ fn feature_flag_enabled(payload: &Value, name: &str) -> bool {
                     .is_some_and(|candidate| candidate.eq_ignore_ascii_case(name))
             })
         })
+}
+
+fn feature_flag_enabled(payload: &Value, name: &str) -> bool {
+    feature_flag(payload, name)
         .and_then(|toggle| toggle.get("enabled").or_else(|| toggle.get("Enabled")))
         .and_then(Value::as_bool)
         .unwrap_or(false)
+}
+
+fn feedback_auto_dismiss_seconds(payload: &Value) -> u32 {
+    // Proton/Unleash serializes this as variant.payload.value, not a top-level payload.
+    feature_flag(payload, "IsConnectionFeedbackEnabled")
+        .and_then(|toggle| toggle.get("variant").or_else(|| toggle.get("Variant")))
+        .and_then(|variant| variant.get("payload").or_else(|| variant.get("Payload")))
+        .and_then(|payload| payload.get("value").or_else(|| payload.get("Value")))
+        .and_then(|value| value.as_u64().or_else(|| value.as_str()?.parse().ok()))
+        .filter(|seconds| (1..=300).contains(seconds))
+        .unwrap_or(10) as u32
 }
 
 fn tunnel_state_name(state: TunnelState) -> &'static str {
@@ -4167,6 +4304,34 @@ mod tests {
         assert!(state.catalog.is_none());
         assert!(state.client_config.is_none());
         fs::remove_dir_all(root).expect("remove temporary cache directory");
+    }
+
+    #[test]
+    fn feedback_delay_reads_the_upstream_variant_payload_and_bounds_it() {
+        for (value, expected) in [
+            (json!("15"), 15),
+            (json!(1), 1),
+            (json!("0"), 10),
+            (json!("-1"), 10),
+            (json!("301"), 10),
+            (json!("1.5"), 10),
+            (Value::Null, 10),
+        ] {
+            assert_eq!(
+                feedback_auto_dismiss_seconds(&json!({"toggles": [{
+                    "name": "IsConnectionFeedbackEnabled", "enabled": true,
+                    "variant": {"payload": {"type": "string", "value": value}}
+                }]})),
+                expected
+            );
+        }
+        assert_eq!(feedback_auto_dismiss_seconds(&json!({})), 10);
+        assert_eq!(
+            feedback_auto_dismiss_seconds(&json!({"Toggles": [{
+                "Name": "IsConnectionFeedbackEnabled", "Variant": {"Payload": {"Value": "20"}}
+            }]})),
+            20
+        );
     }
 
     #[test]

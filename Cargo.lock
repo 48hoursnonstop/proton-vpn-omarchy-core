@@ -2555,6 +2555,7 @@ dependencies = [
  "rand 0.9.5",
  "rand_core 0.6.4",
  "reqwest",
+ "rustls",
  "serde",
  "serde_json",
  "sha2",
@@ -2564,6 +2565,7 @@ dependencies = [
  "unicode-normalization",
  "url",
  "uuid",
+ "webpki-roots",
  "x509-parser",
  "zeroize",
 ]
