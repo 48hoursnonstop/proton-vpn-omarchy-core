@@ -10,6 +10,12 @@ use tokio::sync::watch;
 const AUTOCONNECT_CLIENT_ID: &str = "agent-autoconnect";
 const MAX_ATTEMPTS: usize = 8;
 
+enum AttemptOutcome {
+    WaitingForAccount,
+    Finished,
+    Interrupted,
+}
+
 pub fn spawn(backend: BackendHandle, store: StoreHandle, state_rx: watch::Receiver<StateSnapshot>) {
     tokio::spawn(run(backend, store, state_rx));
 }
@@ -23,11 +29,14 @@ async fn run(
     // while account.get is returning an earlier signed-out/pending snapshot.
     let mut previous_auto_connect = store.auto_connect_enabled();
     let mut previous_account = state_rx.borrow_and_update().account.status;
+    let mut user_stopped = false;
     if store.auto_connect_enabled() {
-        if attempt(&backend, &store, &state_rx).await {
+        match attempt(&backend, &store, &state_rx).await {
             // Do not treat restoration observed during an attempted connection
             // as a second sign-in event (especially after user cancellation).
-            previous_account = state_rx.borrow().account.status;
+            AttemptOutcome::Finished => previous_account = state_rx.borrow().account.status,
+            AttemptOutcome::Interrupted => user_stopped = true,
+            AttemptOutcome::WaitingForAccount => {}
         }
     }
     while state_rx.changed().await.is_ok() {
@@ -40,8 +49,16 @@ async fn run(
 
         previous_auto_connect = auto_connect;
         previous_account = snapshot.account.status;
-        if enabled_now || session_became_ready {
-            attempt(&backend, &store, &state_rx).await;
+        if enabled_now {
+            user_stopped = false;
+        }
+        if enabled_now || (session_became_ready && !user_stopped) {
+            if matches!(
+                attempt(&backend, &store, &state_rx).await,
+                AttemptOutcome::Interrupted
+            ) {
+                user_stopped = true;
+            }
             previous_auto_connect = store.auto_connect_enabled();
             previous_account = state_rx.borrow().account.status;
         }
@@ -52,7 +69,7 @@ async fn attempt(
     backend: &BackendHandle,
     store: &StoreHandle,
     state_rx: &watch::Receiver<StateSnapshot>,
-) -> bool {
+) -> AttemptOutcome {
     let initial_operations: HashSet<_> = {
         let state = state_rx.borrow();
         state
@@ -65,8 +82,10 @@ async fn attempt(
     let mut authenticated = false;
     let mut changes = state_rx.clone();
     for index in 0..MAX_ATTEMPTS {
-        if !store.auto_connect_enabled() || user_interrupted(&changes.borrow(), &initial_operations)
-        {
+        if user_interrupted(&changes.borrow(), &initial_operations) {
+            return AttemptOutcome::Interrupted;
+        }
+        if !store.auto_connect_enabled() {
             break;
         }
         let result = attempt_once(
@@ -77,6 +96,13 @@ async fn attempt(
             &mut authenticated,
         )
         .await;
+        if user_interrupted(&changes.borrow(), &initial_operations) {
+            return AttemptOutcome::Interrupted;
+        }
+        if matches!(result, Err(ref error) if matches!(error.code.as_str(), "connection_cancelled" | "operation_cancelled" | "cancelled"))
+        {
+            return AttemptOutcome::Interrupted;
+        }
         if !matches!(result, Err(ref error) if error.retryable && !matches!(error.code.as_str(), "connection_cancelled" | "operation_cancelled" | "cancelled"))
             || index + 1 == MAX_ATTEMPTS
         {
@@ -89,23 +115,29 @@ async fn attempt(
         let sleep = tokio::time::sleep(delay);
         tokio::pin!(sleep);
         loop {
+            if user_interrupted(&changes.borrow(), &initial_operations) {
+                return AttemptOutcome::Interrupted;
+            }
             if !store.auto_connect_enabled()
-                || user_interrupted(&changes.borrow(), &initial_operations)
                 || matches!(
                     changes.borrow().connection.status,
                     ConnectionStatus::Connected
                 )
             {
-                return authenticated;
+                return AttemptOutcome::Finished;
             }
             tokio::select! {
                 biased;
-                changed = changes.changed() => if changed.is_err() { return authenticated; },
+                changed = changes.changed() => if changed.is_err() { return AttemptOutcome::Finished; },
                 _ = &mut sleep => break,
             }
         }
     }
-    authenticated
+    if authenticated {
+        AttemptOutcome::Finished
+    } else {
+        AttemptOutcome::WaitingForAccount
+    }
 }
 
 fn user_interrupted(state: &StateSnapshot, initial: &HashSet<String>) -> bool {
@@ -355,6 +387,37 @@ mod tests {
                 "user cancelled",
             )))
             .await;
+        fixture.assert_idle().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancellation_before_account_restore_survives_the_sign_in_event() {
+        let mut fixture = Fixture::new();
+        fixture
+            .state
+            .send_modify(|state| state.account.status = AccountStatus::Restoring);
+        let account = fixture.requests.recv().await.unwrap();
+        assert_eq!(account.method, "account.get");
+        let lease = fixture
+            .operations
+            .begin("manual-client", "connection.cancel")
+            .unwrap();
+        fixture.operations.finish(lease, Ok(()));
+        account.reply.send(Ok(json!({"logged_in": false}))).unwrap();
+        fixture
+            .state
+            .send_modify(|state| state.account.status = AccountStatus::SignedIn);
+        fixture.assert_idle().await;
+        fixture
+            .store
+            .request("test", "preferences.set", json!({"auto_connect": false}))
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        fixture
+            .store
+            .request("test", "preferences.set", json!({"auto_connect": true}))
+            .unwrap();
+        fixture.respond(None).await;
         fixture.assert_idle().await;
     }
 
