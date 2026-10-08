@@ -108,6 +108,12 @@ wait for desktop authentication without repeated unlock dialogs. Saved VPN
 settings remain loaded throughout, and auto-connect runs once the account is
 available. The 0.9.6-rc1 credential envelopes and private namespace are unchanged.
 
+Auto-connect retries transient startup failures in the agent, even with the
+panel closed or on Ethernet. It makes at most eight attempts, waiting 5, 10,
+20, 40, then 60 seconds between attempts. Cancel, a manual connection or
+disconnection, disabling auto-connect, and non-retryable failures stop the
+sequence. A successful connection ends the startup retry sequence.
+
 The normal Rust test suite uses an in-memory Secret Service for migration,
 token refresh, sign-out, locked storage and interrupted writes. It checks
 that shared Proton and unrelated credentials are untouched, and that all
