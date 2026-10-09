@@ -4,7 +4,7 @@ use proton_omarchy_protocol::{
 };
 use serde_json::json;
 use std::{
-    collections::VecDeque,
+    collections::{HashSet, VecDeque},
     sync::{Arc, Mutex, MutexGuard},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -531,7 +531,33 @@ fn operation_error(error: &BackendError) -> OperationError {
     }
 }
 
-fn is_cancelled_error(code: &str) -> bool {
+pub(crate) fn connection_sequence_interrupted(
+    state: &StateSnapshot,
+    initial: &HashSet<String>,
+    initiator: &str,
+) -> bool {
+    state
+        .operations
+        .active
+        .iter()
+        .chain(&state.operations.recent)
+        .any(|operation| {
+            !initial.contains(&operation.id)
+                && ((operation.kind == "connection.connect"
+                    && (operation.stage == "tunnel.cancelling"
+                        || operation.state == OperationStatus::Cancelled))
+                    || (operation.initiator_client_instance_id != initiator
+                        && matches!(
+                            operation.kind.as_str(),
+                            "connection.connect"
+                                | "connection.cancel"
+                                | "connection.disconnect"
+                                | "account.logout"
+                        )))
+        })
+}
+
+pub(crate) fn is_cancelled_error(code: &str) -> bool {
     matches!(
         code,
         "cancelled" | "operation_cancelled" | "connection_cancelled" | "fido2_cancelled"

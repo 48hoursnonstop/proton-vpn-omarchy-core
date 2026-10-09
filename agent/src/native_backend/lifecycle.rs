@@ -1,9 +1,13 @@
 use super::network::{NetworkManagerBackend, WifiSecurityObservation};
-use crate::{backend::BackendHandle, store::StoreHandle};
+use crate::{
+    backend::BackendHandle,
+    operations::{connection_sequence_interrupted, is_cancelled_error},
+    store::StoreHandle,
+};
 use nmdbus::dbus::{blocking::Connection, message::MatchRule};
 use proton_omarchy_protocol::{AccountStatus, ConnectionStatus, StateSnapshot};
 use serde_json::{json, Value};
-use std::{thread, time::Duration};
+use std::{collections::HashSet, thread, time::Duration};
 use tokio::sync::{mpsc, watch};
 
 const LIFECYCLE_CLIENT_ID: &str = "agent-lifecycle";
@@ -143,9 +147,40 @@ async fn reconnect_after_resume(
         return;
     }
 
+    let initial_operations: HashSet<_> = state_rx
+        .borrow()
+        .operations
+        .recent
+        .iter()
+        .map(|operation| operation.id.clone())
+        .collect();
+    let mut changes = state_rx.clone();
     for delay in RESUME_RETRY_DELAYS {
         if !delay.is_zero() {
-            tokio::time::sleep(*delay).await;
+            let sleep = tokio::time::sleep(*delay);
+            tokio::pin!(sleep);
+            loop {
+                if connection_sequence_interrupted(
+                    &changes.borrow(),
+                    &initial_operations,
+                    LIFECYCLE_CLIENT_ID,
+                ) || (!was_active && !store.auto_connect_enabled())
+                {
+                    return;
+                }
+                tokio::select! {
+                    biased;
+                    changed = changes.changed() => if changed.is_err() { return; },
+                    _ = &mut sleep => break,
+                }
+            }
+        }
+        if connection_sequence_interrupted(
+            &changes.borrow(),
+            &initial_operations,
+            LIFECYCLE_CLIENT_ID,
+        ) {
+            return;
         }
         if state_rx.borrow().account.status != AccountStatus::SignedIn {
             continue;
@@ -160,7 +195,14 @@ async fn reconnect_after_resume(
         {
             continue;
         }
-        if vpn_is_active(&state_rx.borrow()) {
+        if vpn_is_active(&state_rx.borrow())
+            || connection_sequence_interrupted(
+                &changes.borrow(),
+                &initial_operations,
+                LIFECYCLE_CLIENT_ID,
+            )
+            || (!was_active && !store.auto_connect_enabled())
+        {
             return;
         }
 
@@ -177,13 +219,16 @@ async fn reconnect_after_resume(
             .get("connect_params")
             .cloned()
             .unwrap_or_else(|| json!({}));
-        if backend
+        match backend
             .request(LIFECYCLE_CLIENT_ID, "connection.connect", params)
             .await
-            .is_ok()
         {
-            record_recent(store, &resolved);
-            return;
+            Ok(_) => {
+                record_recent(store, &resolved);
+                return;
+            }
+            Err(error) if !error.retryable || is_cancelled_error(&error.code) => return,
+            Err(_) => {}
         }
     }
 }
@@ -212,6 +257,98 @@ fn should_reconnect(was_active: bool, auto_connect: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        backend::{BackendError, BackendFlavor},
+        operations::OperationCoordinator,
+    };
+
+    async fn assert_resume_retry(
+        error: BackendError,
+        manual_action: Option<&str>,
+        should_retry: bool,
+    ) {
+        let root = std::env::temp_dir().join(format!("proton-resume-{}", uuid::Uuid::new_v4()));
+        let (state, receiver) = watch::channel(StateSnapshot::default());
+        let operations = OperationCoordinator::new(state.clone());
+        let store = StoreHandle::open(
+            root.join("state.json"),
+            &root.join("legacy.json"),
+            root.join("config/proton-vpn-omarchy/lifecycle.json"),
+            state.clone(),
+            operations.clone(),
+        )
+        .unwrap();
+        state.send_modify(|state| state.account.status = AccountStatus::SignedIn);
+        let (tx, mut requests) = mpsc::channel(16);
+        let backend = BackendHandle::new(tx, operations.clone(), BackendFlavor::Native);
+        let task = tokio::spawn(async move {
+            reconnect_after_resume(&backend, &store, &receiver, true).await;
+        });
+        let observe = requests.recv().await.unwrap();
+        assert_eq!(observe.method, "connection.observe");
+        observe.reply.send(Ok(json!({}))).unwrap();
+        let connect = requests.recv().await.unwrap();
+        assert_eq!(connect.method, "connection.connect");
+        connect.reply.send(Err(error)).unwrap();
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        if let Some(method) = manual_action {
+            let lease = operations.begin("manual-client", method).unwrap();
+            operations.finish(lease, Ok(()));
+        }
+        let next = tokio::time::timeout(Duration::from_secs(60), requests.recv()).await;
+        let retried = matches!(next, Ok(Some(_)));
+        if should_retry {
+            if let Ok(Some(observe)) = next {
+                assert_eq!(observe.method, "connection.observe");
+                observe.reply.send(Ok(json!({}))).unwrap();
+                let connect = requests.recv().await.unwrap();
+                assert_eq!(connect.method, "connection.connect");
+                connect.reply.send(Ok(json!({}))).unwrap();
+            }
+        }
+        task.abort();
+        let _ = task.await;
+        std::fs::remove_dir_all(root).unwrap();
+        assert!(retried == should_retry, "unexpected resume retry decision");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn resume_does_not_retry_cancelled_or_permanent_connection_errors() {
+        for error in [
+            BackendError::new("connection_cancelled", "cancelled").retryable(true),
+            BackendError::new("not_authenticated", "sign in"),
+        ] {
+            assert_resume_retry(error, None, false).await;
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn manual_action_during_resume_backoff_stops_reconnection() {
+        for method in [
+            "connection.cancel",
+            "connection.disconnect",
+            "connection.connect",
+            "account.logout",
+        ] {
+            assert_resume_retry(
+                BackendError::new("network_conflict_detected", "network is starting")
+                    .retryable(true),
+                Some(method),
+                false,
+            )
+            .await;
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn resume_still_retries_transient_connection_errors() {
+        assert_resume_retry(
+            BackendError::new("network_conflict_detected", "network is starting").retryable(true),
+            None,
+            true,
+        )
+        .await;
+    }
 
     #[test]
     fn resume_restores_only_an_active_or_auto_connected_session() {

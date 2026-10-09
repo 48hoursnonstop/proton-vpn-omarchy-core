@@ -2535,7 +2535,7 @@ dependencies = [
 
 [[package]]
 name = "proton-omarchy-agent"
-version = "0.9.9"
+version = "0.9.10"
 dependencies = [
  "authenticator",
  "base64 0.22.1",
@@ -2572,7 +2572,7 @@ dependencies = [
 
 [[package]]
 name = "proton-omarchy-protocol"
-version = "0.9.9"
+version = "0.9.10"
 dependencies = [
  "serde",
  "serde_json",
@@ -2580,7 +2580,7 @@ dependencies = [
 
 [[package]]
 name = "proton-omarchy-splitd"
-version = "0.9.9"
+version = "0.9.10"
 dependencies = [
  "ipnet",
  "libc",

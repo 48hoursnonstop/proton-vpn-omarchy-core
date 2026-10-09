@@ -1,8 +1,9 @@
 use crate::{
     backend::{BackendError, BackendHandle},
+    operations::{connection_sequence_interrupted, is_cancelled_error},
     store::StoreHandle,
 };
-use proton_omarchy_protocol::{AccountStatus, ConnectionStatus, OperationStatus, StateSnapshot};
+use proton_omarchy_protocol::{AccountStatus, ConnectionStatus, StateSnapshot};
 use serde_json::{json, Value};
 use std::{collections::HashSet, time::Duration};
 use tokio::sync::watch;
@@ -30,8 +31,11 @@ async fn run(
     let mut previous_auto_connect = store.auto_connect_enabled();
     let mut previous_account = state_rx.borrow_and_update().account.status;
     let mut user_stopped = false;
+    // Keep the baseline while waiting for the keyring, so a manual action
+    // between account.get and a later sign-in still stops startup connection.
+    let mut initial_operations = recent_operation_ids(&state_rx.borrow());
     if store.auto_connect_enabled() {
-        match attempt(&backend, &store, &state_rx).await {
+        match attempt(&backend, &store, &state_rx, &initial_operations).await {
             // Do not treat restoration observed during an attempted connection
             // as a second sign-in event (especially after user cancellation).
             AttemptOutcome::Finished => previous_account = state_rx.borrow().account.status,
@@ -49,12 +53,16 @@ async fn run(
 
         previous_auto_connect = auto_connect;
         previous_account = snapshot.account.status;
+        if user_interrupted(&snapshot, &initial_operations) {
+            user_stopped = true;
+        }
         if enabled_now {
             user_stopped = false;
+            initial_operations = recent_operation_ids(&snapshot);
         }
         if enabled_now || (session_became_ready && !user_stopped) {
             if matches!(
-                attempt(&backend, &store, &state_rx).await,
+                attempt(&backend, &store, &state_rx, &initial_operations).await,
                 AttemptOutcome::Interrupted
             ) {
                 user_stopped = true;
@@ -69,20 +77,12 @@ async fn attempt(
     backend: &BackendHandle,
     store: &StoreHandle,
     state_rx: &watch::Receiver<StateSnapshot>,
+    initial_operations: &HashSet<String>,
 ) -> AttemptOutcome {
-    let initial_operations: HashSet<_> = {
-        let state = state_rx.borrow();
-        state
-            .operations
-            .recent
-            .iter()
-            .map(|operation| operation.id.clone())
-            .collect()
-    };
     let mut authenticated = false;
     let mut changes = state_rx.clone();
     for index in 0..MAX_ATTEMPTS {
-        if user_interrupted(&changes.borrow(), &initial_operations) {
+        if user_interrupted(&changes.borrow(), initial_operations) {
             return AttemptOutcome::Interrupted;
         }
         if !store.auto_connect_enabled() {
@@ -92,20 +92,17 @@ async fn attempt(
             backend,
             store,
             state_rx,
-            &initial_operations,
+            initial_operations,
             &mut authenticated,
         )
         .await;
-        if user_interrupted(&changes.borrow(), &initial_operations) {
+        if user_interrupted(&changes.borrow(), initial_operations) {
             return AttemptOutcome::Interrupted;
         }
-        if matches!(result, Err(ref error) if matches!(error.code.as_str(), "connection_cancelled" | "operation_cancelled" | "cancelled"))
-        {
+        if matches!(result, Err(ref error) if is_cancelled_error(&error.code)) {
             return AttemptOutcome::Interrupted;
         }
-        if !matches!(result, Err(ref error) if error.retryable && !matches!(error.code.as_str(), "connection_cancelled" | "operation_cancelled" | "cancelled"))
-            || index + 1 == MAX_ATTEMPTS
-        {
+        if !matches!(result, Err(ref error) if error.retryable) || index + 1 == MAX_ATTEMPTS {
             break;
         }
         // Retry transient boot/network failures without a frontend or a Wi-Fi
@@ -115,7 +112,7 @@ async fn attempt(
         let sleep = tokio::time::sleep(delay);
         tokio::pin!(sleep);
         loop {
-            if user_interrupted(&changes.borrow(), &initial_operations) {
+            if user_interrupted(&changes.borrow(), initial_operations) {
                 return AttemptOutcome::Interrupted;
             }
             if !store.auto_connect_enabled()
@@ -140,25 +137,17 @@ async fn attempt(
     }
 }
 
-fn user_interrupted(state: &StateSnapshot, initial: &HashSet<String>) -> bool {
+fn recent_operation_ids(state: &StateSnapshot) -> HashSet<String> {
     state
         .operations
-        .active
+        .recent
         .iter()
-        .chain(&state.operations.recent)
-        .any(|operation| {
-            !initial.contains(&operation.id)
-                && (operation.stage == "tunnel.cancelling"
-                    || operation.state == OperationStatus::Cancelled
-                    || (operation.initiator_client_instance_id != AUTOCONNECT_CLIENT_ID
-                        && matches!(
-                            operation.kind.as_str(),
-                            "connection.connect"
-                                | "connection.cancel"
-                                | "connection.disconnect"
-                                | "account.logout"
-                        )))
-        })
+        .map(|operation| operation.id.clone())
+        .collect()
+}
+
+fn user_interrupted(state: &StateSnapshot, initial: &HashSet<String>) -> bool {
+    connection_sequence_interrupted(state, initial, AUTOCONNECT_CLIENT_ID)
 }
 
 async fn attempt_once(
@@ -387,6 +376,68 @@ mod tests {
                 "user cancelled",
             )))
             .await;
+        fixture.assert_idle().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn manual_action_while_waiting_for_keyring_stops_late_autoconnect() {
+        for method in [
+            "connection.cancel",
+            "connection.disconnect",
+            "connection.connect",
+            "account.logout",
+        ] {
+            let mut fixture = Fixture::new();
+            fixture
+                .state
+                .send_modify(|state| state.account.status = AccountStatus::Restoring);
+            let account = fixture.requests.recv().await.unwrap();
+            assert_eq!(account.method, "account.get");
+            account.reply.send(Ok(json!({"logged_in": false}))).unwrap();
+            tokio::time::sleep(Duration::from_millis(1)).await;
+
+            let lease = fixture.operations.begin("manual-client", method).unwrap();
+            fixture.operations.finish(lease, Ok(()));
+            tokio::time::sleep(Duration::from_millis(1)).await;
+            fixture
+                .state
+                .send_modify(|state| state.account.status = AccountStatus::SignedIn);
+            fixture.assert_idle().await;
+            fixture
+                .store
+                .request("test", "preferences.set", json!({"auto_connect": false}))
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(1)).await;
+            fixture
+                .store
+                .request("test", "preferences.set", json!({"auto_connect": true}))
+                .unwrap();
+            fixture.respond(None).await;
+            fixture.assert_idle().await;
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelling_security_key_does_not_disable_later_auto_connection() {
+        let mut fixture = Fixture::new();
+        fixture
+            .state
+            .send_modify(|state| state.account.status = AccountStatus::SignedOut);
+        let account = fixture.requests.recv().await.unwrap();
+        assert_eq!(account.method, "account.get");
+        account.reply.send(Ok(json!({"logged_in": false}))).unwrap();
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        let lease = fixture
+            .operations
+            .begin("manual-client", "account.authenticate_fido2")
+            .unwrap();
+        let error = BackendError::new("fido2_cancelled", "cancelled");
+        fixture.operations.finish(lease, Err(&error));
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        fixture
+            .state
+            .send_modify(|state| state.account.status = AccountStatus::SignedIn);
+        fixture.respond(None).await;
         fixture.assert_idle().await;
     }
 
