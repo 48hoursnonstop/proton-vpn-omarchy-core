@@ -209,6 +209,7 @@ impl SocketMarker {
                 attach_type,
                 name,
                 destination_mark_program(
+                    marker.pid_map.as_raw_fd(),
                     marker.mode_map.as_raw_fd(),
                     if ipv6 {
                         marker.ipv6_map.as_raw_fd()
@@ -545,6 +546,7 @@ fn socket_mark_program(pid_map_fd: i32) -> Vec<BpfInsn> {
 }
 
 fn destination_mark_program(
+    pid_map_fd: i32,
     mode_map_fd: i32,
     range_map_fd: i32,
     bypass_map_fd: i32,
@@ -552,12 +554,25 @@ fn destination_mark_program(
 ) -> Vec<BpfInsn> {
     let mut program = ProgramBuilder::default();
     program.mov_reg(6, 1);
+    // Recompute the application baseline for every destination. SO_MARK may
+    // contain a decision made for a preceding sendmsg on the same UDP socket.
+    program.call(BPF_FUNC_GET_CURRENT_PID_TGID);
+    program.rsh_imm(0, 32);
+    program.store_reg32(10, -36, 0);
+    program.load_map(1, pid_map_fd);
+    program.stack_pointer(2, -36);
+    program.call(BPF_FUNC_MAP_LOOKUP_ELEM);
+    program.mov_imm(8, 0);
+    program.jump_eq_imm(0, 0, "application_baseline");
+    program.mov_imm(8, FWMARK_VALUE as i32);
+    program.label("application_baseline");
     program.call(BPF_FUNC_GET_CURRENT_UID_GID);
-    program.store_reg32(10, -4, 0);
+    // -24..0 holds the IPv6 LPM key; -28 holds the socket option buffer.
+    program.store_reg32(10, -32, 0);
 
     if ipv6 {
         program.store_imm32(10, -24, 160);
-        program.load32(0, 10, -4);
+        program.load32(0, 10, -32);
         program.store_reg32(10, -20, 0);
         program.load64(0, 6, 8);
         program.store_reg64(10, -16, 0);
@@ -565,7 +580,7 @@ fn destination_mark_program(
         program.store_reg64(10, -8, 0);
     } else {
         program.store_imm32(10, -16, 64);
-        program.load32(0, 10, -4);
+        program.load32(0, 10, -32);
         program.store_reg32(10, -12, 0);
         program.load32(0, 6, 4);
         program.store_reg32(10, -8, 0);
@@ -574,21 +589,25 @@ fn destination_mark_program(
     program.stack_pointer(2, if ipv6 { -24 } else { -16 });
     program.call(BPF_FUNC_MAP_LOOKUP_ELEM);
     program.jump_eq_imm(0, 0, "split_policy");
-    program.mov_imm(7, 0);
-    program.jump("mark_socket");
+    program.jump("exclude_destination");
 
     program.label("split_policy");
     program.load_map(1, mode_map_fd);
-    program.stack_pointer(2, -4);
+    program.stack_pointer(2, -32);
     program.call(BPF_FUNC_MAP_LOOKUP_ELEM);
-    program.jump_eq_imm(0, 0, "allow");
+    program.jump_eq_imm(0, 0, "mark_socket");
     program.load32(7, 0, 0);
     program.load_map(1, range_map_fd);
     program.stack_pointer(2, if ipv6 { -24 } else { -16 });
     program.call(BPF_FUNC_MAP_LOOKUP_ELEM);
-    program.jump_eq_imm(0, 0, "allow");
+    program.jump_eq_imm(0, 0, "mark_socket");
+    program.jump_eq_imm(7, 0, "exclude_destination");
+    program.mov_imm(8, 0);
+    program.jump("mark_socket");
+    program.label("exclude_destination");
+    program.mov_imm(8, FWMARK_VALUE as i32);
     program.label("mark_socket");
-    program.jump_eq_imm(7, 0, "set_mark");
+    program.jump_eq_imm(8, FWMARK_VALUE as i32, "set_mark");
     program.get_socket_mark(6, -28);
     program.load32(0, 10, -28);
     program.jump_ne_imm(0, FWMARK_VALUE as i32, "allow");
@@ -760,8 +779,8 @@ mod tests {
     #[test]
     fn destination_programs_have_resolved_forward_jumps() {
         for program in [
-            destination_mark_program(17, 18, 20, false),
-            destination_mark_program(17, 19, 21, true),
+            destination_mark_program(16, 17, 18, 20, false),
+            destination_mark_program(16, 17, 19, 21, true),
         ] {
             assert!(program
                 .iter()
@@ -786,4 +805,64 @@ mod tests {
         assert_eq!(ipv6.prefix_len, 64);
         assert_eq!(&ipv6.address[..4], &[0x20, 0x01, 0x0d, 0xb8]);
     }
+
+    #[test]
+    #[ignore = "requires CAP_BPF/CAP_SYS_ADMIN; loads scratch programs but never attaches them"]
+    fn destination_programs_pass_kernel_verifier_without_attaching() {
+        let pids = create_map::<u32, u32>("audit_pids", BPF_MAP_TYPE_HASH, 4, 0).unwrap();
+        let modes = create_map::<u32, u32>("audit_modes", BPF_MAP_TYPE_HASH, 4, 0).unwrap();
+        for ipv6 in [false, true] {
+            let ranges = if ipv6 {
+                create_map::<Ipv6LpmKey, u32>(
+                    "audit_ranges",
+                    BPF_MAP_TYPE_LPM_TRIE,
+                    4,
+                    BPF_F_NO_PREALLOC,
+                )
+            } else {
+                create_map::<Ipv4LpmKey, u32>(
+                    "audit_ranges",
+                    BPF_MAP_TYPE_LPM_TRIE,
+                    4,
+                    BPF_F_NO_PREALLOC,
+                )
+            }
+            .unwrap();
+            let bypass = if ipv6 {
+                create_map::<Ipv6LpmKey, u32>(
+                    "audit_bypass",
+                    BPF_MAP_TYPE_LPM_TRIE,
+                    4,
+                    BPF_F_NO_PREALLOC,
+                )
+            } else {
+                create_map::<Ipv4LpmKey, u32>(
+                    "audit_bypass",
+                    BPF_MAP_TYPE_LPM_TRIE,
+                    4,
+                    BPF_F_NO_PREALLOC,
+                )
+            }
+            .unwrap();
+            for attach in if ipv6 {
+                [BPF_CGROUP_INET6_CONNECT, BPF_CGROUP_UDP6_SENDMSG]
+            } else {
+                [BPF_CGROUP_INET4_CONNECT, BPF_CGROUP_UDP4_SENDMSG]
+            } {
+                let code = destination_mark_program(
+                    pids.as_raw_fd(),
+                    modes.as_raw_fd(),
+                    ranges.as_raw_fd(),
+                    bypass.as_raw_fd(),
+                    ipv6,
+                );
+                let _program =
+                    load_program(BPF_PROG_TYPE_CGROUP_SOCK_ADDR, attach, "audit_dst", &code)
+                        .unwrap();
+            }
+        }
+    }
 }
+
+#[cfg(test)]
+mod execution_tests;

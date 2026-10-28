@@ -79,6 +79,7 @@ impl ApiRoute {
     }
 }
 
+#[derive(Clone)]
 pub struct ApiSession {
     pub uid: String,
     pub access_token: String,
@@ -99,7 +100,11 @@ impl ApiSession {
 pub struct ProtonApi {
     client: reqwest::Client,
     alternative_client: reqwest::Client,
-    events: EventSink,
+    pub(super) events: EventSink,
+    headers: header::HeaderMap,
+    cookie_jar: Arc<Jar>,
+    guest_hole: super::guest_hole::Recovery,
+    guest_transport: bool,
     human_verification: Arc<tokio::sync::Mutex<()>>,
     alternative_routing_enabled: Arc<AtomicBool>,
     alternative_route: Arc<tokio::sync::Mutex<Option<CachedAlternativeRoute>>>,
@@ -133,11 +138,15 @@ impl ProtonApi {
         // names do not match their IP-valued TXT records. The official clients
         // therefore authenticate these endpoints with dedicated SPKI pins.
         // Enforce those pins during TLS, before sending any HTTP credentials.
-        let alternative_client = build_api_client(headers, cookie_jar, true)?;
+        let alternative_client = build_api_client(headers.clone(), cookie_jar.clone(), true)?;
         Ok(Self {
             client,
             alternative_client,
             events,
+            headers,
+            cookie_jar,
+            guest_hole: Default::default(),
+            guest_transport: false,
             human_verification: Arc::new(tokio::sync::Mutex::new(())),
             alternative_routing_enabled: Arc::new(AtomicBool::new(true)),
             alternative_route: Arc::new(tokio::sync::Mutex::new(None)),
@@ -501,6 +510,46 @@ impl ProtonApi {
         body: Option<Value>,
         session: Option<&ApiSession>,
     ) -> NativeResult<Value> {
+        let operation = if self.guest_transport
+            || !self.alternative_routing_enabled.load(Ordering::Acquire)
+            || endpoint == "/vpn/v1/location"
+        {
+            None
+        } else {
+            self.guest_hole.operation(&self.events)
+        };
+        let result = self
+            .request_direct(method.clone(), endpoint, body.clone(), session)
+            .await;
+        if result
+            .as_ref()
+            .err()
+            .is_some_and(|error| super::guest_hole::transport_failure(&error.code))
+        {
+            if let Some(operation) = operation {
+                return self
+                    .guest_hole
+                    .request(
+                        self.clone(),
+                        operation,
+                        method,
+                        endpoint.to_owned(),
+                        body,
+                        session.cloned(),
+                    )
+                    .await;
+            }
+        }
+        result
+    }
+
+    pub(super) async fn request_direct(
+        &self,
+        method: Method,
+        endpoint: &str,
+        body: Option<Value>,
+        session: Option<&ApiSession>,
+    ) -> NativeResult<Value> {
         let mut transient_attempt = 0_u64;
         let mut human_verification_token = None;
         let mut route = self.initial_route().await;
@@ -598,6 +647,42 @@ impl ProtonApi {
         }
     }
 
+    pub(super) async fn guest_idle(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        self.guest_hole.idle().await
+    }
+
+    pub(super) fn cancel_guest_hole(&self) {
+        self.guest_hole.cancel();
+    }
+
+    pub(super) fn for_guest_hole(
+        &self,
+        interface: &str,
+        addresses: &[std::net::SocketAddr],
+    ) -> NativeResult<Self> {
+        let client = api_client_builder(self.headers.clone(), self.cookie_jar.clone(), false)?
+            .interface(interface)
+            .no_proxy()
+            .resolve_to_addrs("vpn-api.proton.me", addresses)
+            .timeout(Duration::from_secs(8))
+            .build()
+            .map_err(|error| {
+                NativeError::new(
+                    "guest_hole_failed",
+                    "Unable to bind the recovery API transport",
+                )
+                .with_source(error)
+            })?;
+        Ok(Self {
+            client: client.clone(),
+            alternative_client: client,
+            alternative_routing_enabled: Arc::new(AtomicBool::new(false)),
+            alternative_route: Arc::new(tokio::sync::Mutex::new(None)),
+            guest_transport: true,
+            ..self.clone()
+        })
+    }
+
     async fn initial_route(&self) -> ApiRoute {
         if !self.alternative_routing_enabled.load(Ordering::Acquire) {
             return ApiRoute::Direct;
@@ -680,15 +765,7 @@ fn build_api_client(
     cookie_jar: Arc<Jar>,
     accept_pinned_name_mismatch: bool,
 ) -> NativeResult<reqwest::Client> {
-    reqwest::Client::builder()
-        .default_headers(headers)
-        .https_only(true)
-        .cookie_provider(cookie_jar)
-        .tls_info(true)
-        .redirect(reqwest::redirect::Policy::none())
-        .use_preconfigured_tls(tls::config(accept_pinned_name_mismatch)?)
-        .connect_timeout(Duration::from_secs(10))
-        .timeout(Duration::from_secs(30))
+    api_client_builder(headers, cookie_jar, accept_pinned_name_mismatch)?
         .build()
         .map_err(|error| {
             NativeError::new(
@@ -697,6 +774,22 @@ fn build_api_client(
             )
             .with_source(error)
         })
+}
+
+fn api_client_builder(
+    headers: header::HeaderMap,
+    cookie_jar: Arc<Jar>,
+    accept_pinned_name_mismatch: bool,
+) -> NativeResult<reqwest::ClientBuilder> {
+    Ok(reqwest::Client::builder()
+        .default_headers(headers)
+        .https_only(true)
+        .cookie_provider(cookie_jar)
+        .tls_info(true)
+        .redirect(reqwest::redirect::Policy::none())
+        .use_preconfigured_tls(tls::config(accept_pinned_name_mismatch)?)
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(30)))
 }
 
 async fn decode_api_response(

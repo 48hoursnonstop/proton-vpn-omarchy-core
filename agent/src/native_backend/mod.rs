@@ -3,10 +3,13 @@ mod api;
 mod apps;
 mod catalog;
 mod fido2;
+mod guest_hole;
 mod lifecycle;
 mod local_agent;
+mod logout;
 mod models;
 mod network;
+mod refresh;
 mod secret_store;
 mod server_validation;
 mod session_bootstrap;
@@ -247,6 +250,10 @@ struct RuntimeState {
     connection_feedback_auto_dismiss_seconds: u32,
     feedback_session: Option<telemetry::ConnectionFeedbackSession>,
     pending_connection_trigger: String,
+    remote_refresh_after: Option<Instant>,
+    location_retry_after: Option<Instant>,
+    location_identity: Option<Vec<String>>,
+    physical_location_known: bool,
 }
 
 struct NativeRuntime {
@@ -410,6 +417,28 @@ impl NativeRuntime {
     }
 
     fn spawn_maintenance(runtime: &Arc<Self>) {
+        let data_runtime = Arc::downgrade(runtime);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(30));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                let Some(runtime) = data_runtime.upgrade() else {
+                    return;
+                };
+                if !runtime
+                    .events
+                    .state_tx
+                    .borrow()
+                    .operations
+                    .active
+                    .is_empty()
+                {
+                    continue;
+                }
+                let _ = runtime.refresh_remote_data(false).await;
+            }
+        });
         let token_runtime = Arc::downgrade(runtime);
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(12 * 60 * 60));
@@ -499,6 +528,17 @@ impl NativeRuntime {
     }
 
     async fn initialize(self: &Arc<Self>) {
+        if let Err(error) =
+            tokio::task::spawn_blocking(|| NetworkManagerBackend.cleanup_guest_profiles())
+                .await
+                .map_err(join_error)
+                .and_then(|result| result)
+        {
+            eprintln!(
+                "proton-omarchy-agent: recovery tunnel cleanup failed: {}",
+                error.code
+            );
+        }
         let paths = self.paths.clone();
         let loaded = tokio::task::spawn_blocking(move || load_state(&paths)).await;
         let mut initialization_error = None;
@@ -649,6 +689,11 @@ impl NativeRuntime {
                 Ok(json!({ "logged_in": self.state.read().await.session.is_some() }))
             }
             "account.retry_restore" => self.restore_session().await,
+            "account.refresh" => self.refresh_remote_data(true).await,
+            "guest_hole.cancel" => {
+                self.api.cancel_guest_hole();
+                Ok(json!({"cancelled": true}))
+            }
             "account.upgrade_url" => self.account_upgrade_url(params).await,
             "report_issue.categories.get" => self.report_issue_categories().await,
             "report_issue.submit" => self.report_issue_submit(params).await,
@@ -1071,6 +1116,8 @@ impl NativeRuntime {
             state.session = Some(session);
             state.catalog = Some(catalog);
             state.client_config = Some(client_config);
+            state.remote_refresh_after = Some(Instant::now() + Duration::from_secs(15 * 60));
+            state.physical_location_known = false;
         }
         self.pending_auth.lock().await.take();
         self.refresh_connection_feedback_flag().await;
@@ -1141,13 +1188,8 @@ impl NativeRuntime {
         let stored = self.state.read().await.session.clone();
         let api_session =
             pending.or_else(|| stored.as_ref().map(session_bootstrap::stored_api_session));
-        if let Some(api_session) = api_session.as_ref() {
-            if let Err(error) = self.api.logout(api_session).await {
-                if error.code != "authentication_expired" {
-                    return Err(error);
-                }
-            }
-        }
+        // The durable no-reimport marker and local deletion must succeed before
+        // revocation is attempted. API censorship must never retain a login.
         if let Some(session) = stored.as_ref() {
             let secret_store = self.secret_store.clone();
             let account_name = session.account_name.clone();
@@ -1164,9 +1206,19 @@ impl NativeRuntime {
             state.traffic = None;
             state.connection_feedback_feature_enabled = false;
             state.feedback_session = None;
+            state.physical_location_known = false;
+            state.location_identity = None;
+            state.location_retry_after = None;
+            state.remote_refresh_after = None;
         }
-        remove_cache_file(&self.paths.catalog)?;
-        remove_cache_file(&self.paths.client_config)?;
+        for path in [&self.paths.catalog, &self.paths.client_config] {
+            if let Err(error) = remove_cache_file(path) {
+                eprintln!(
+                    "proton-omarchy-agent: signed-out cache cleanup failed: {}",
+                    error.code
+                );
+            }
+        }
         self.emit_account().await;
         self.emit_features().await;
         self.events.emit(
@@ -1180,7 +1232,14 @@ impl NativeRuntime {
                 "longitude": null,
             }),
         );
-        Ok(json!({ "logged_out": true }))
+        let remote_revoked = logout::revoke(async {
+            match api_session.as_ref() {
+                Some(session) => self.api.logout(session).await,
+                None => Ok(()),
+            }
+        })
+        .await;
+        Ok(json!({ "logged_out": true, "remote_revoked": remote_revoked }))
     }
 
     async fn refresh_tokens(&self) -> NativeResult<()> {
@@ -1247,9 +1306,10 @@ impl NativeRuntime {
     }
 
     async fn emit_device_location(&self) {
-        let location = self.state.read().await.session.as_ref().map(|session| {
+        let state = self.state.read().await;
+        let location = state.session.as_ref().map(|session| {
             json!({
-                "known": true,
+                "known": state.physical_location_known,
                 "ip_address": session.vpn.location.ip,
                 "country_code": session.vpn.location.country,
                 "isp": session.vpn.location.isp,
@@ -2216,6 +2276,7 @@ impl NativeRuntime {
         Ok(json!({
             "observation_known": true,
             "status": tunnel_state_name(observation.state),
+            "owned": observation.owned,
             "connector_initialized": true,
         }))
     }
@@ -2227,6 +2288,8 @@ impl NativeRuntime {
         // create a tunnel or change NetworkManager configuration.
         let runtime = Arc::clone(self);
         let preparation = tokio::spawn(async move {
+            let _ = runtime.refresh_remote_data(false).await;
+            runtime.ensure_client_config().await?;
             runtime.refresh_certificate_if_needed().await?;
             runtime.ensure_signed_catalog().await
         });
@@ -2236,6 +2299,11 @@ impl NativeRuntime {
             prepared = preparation => prepared.map_err(join_error)??,
         }
         let profile_id = connection_profile_id(&params)?;
+        let _guest_idle = tokio::select! {
+            biased;
+            error = self.wait_for_connection_cancel(attempt) => return Err(error),
+            guard = self.api.guest_idle() => guard,
+        };
         let _network_guard = tokio::select! {
             biased;
             error = self.wait_for_connection_cancel(attempt) => return Err(error),
@@ -2261,7 +2329,11 @@ impl NativeRuntime {
                 &params,
                 tier,
                 &excluded_locations,
-                &session.vpn.location.country,
+                if state.physical_location_known {
+                    &session.vpn.location.country
+                } else {
+                    ""
+                },
             )?;
             (
                 target,
@@ -2740,9 +2812,7 @@ impl NativeRuntime {
                     }
                     AgentUpdate::Error(error) => {
                         if let Ok(observation) = self.observe_blocking().await {
-                            if observation.state == TunnelState::Connected {
-                                self.emit_connection(&observation, Some(&error)).await;
-                            }
+                            self.emit_connection(&observation, Some(&error)).await;
                         }
                     }
                     AgentUpdate::Stopped => {
@@ -2755,9 +2825,14 @@ impl NativeRuntime {
                 return;
             }
             let observation = match self.observe_blocking().await {
-                Ok(observation) if observation.state == TunnelState::Connected => observation,
-                _ => return,
+                Ok(observation) => observation,
+                Err(_) => return,
             };
+            if observation.state != TunnelState::Connected {
+                self.emit_connection(&observation, None).await;
+                self.emit_features().await;
+                return;
+            }
             *self.local_agent_snapshot.write().await = AgentSnapshot::default();
             self.emit_connection(&observation, Some("The Proton Local Agent is reconnecting"))
                 .await;
@@ -3062,6 +3137,8 @@ impl NativeRuntime {
         let observation = self.observe_blocking().await?;
         if observation.state != TunnelState::Connected {
             self.state.write().await.traffic = None;
+            self.emit_connection(&observation, None).await;
+            self.emit_features().await;
             return Ok(json!({ "known": false }));
         }
         let stats = Path::new("/sys/class/net/proton0/statistics");
@@ -3659,6 +3736,10 @@ fn load_cached_state(paths: &Paths, session: Option<SessionData>) -> RuntimeStat
         connection_feedback_auto_dismiss_seconds: 10,
         feedback_session: None,
         pending_connection_trigger: "connection_card".into(),
+        remote_refresh_after: None,
+        location_retry_after: None,
+        location_identity: None,
+        physical_location_known: false,
     }
 }
 

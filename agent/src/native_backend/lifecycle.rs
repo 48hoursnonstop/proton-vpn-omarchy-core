@@ -28,6 +28,11 @@ pub(super) fn spawn(
     network: NetworkManagerBackend,
 ) {
     tokio::spawn(monitor_wifi(state_tx.clone(), network));
+    tokio::spawn(monitor_connection(
+        state_tx.subscribe(),
+        backend.clone(),
+        store.clone(),
+    ));
 
     let (sleep_tx, sleep_rx) = mpsc::unbounded_channel();
     spawn_sleep_signal_monitor(sleep_tx);
@@ -37,6 +42,58 @@ pub(super) fn spawn(
         backend,
         store,
     ));
+}
+
+async fn monitor_connection(
+    state_rx: watch::Receiver<StateSnapshot>,
+    backend: BackendHandle,
+    store: StoreHandle,
+) {
+    let mut interval = tokio::time::interval(Duration::from_secs(2));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut owned_operations = None;
+    loop {
+        interval.tick().await;
+        let before = state_rx.borrow().clone();
+        if before.account.status != AccountStatus::SignedIn {
+            owned_operations = None;
+            continue;
+        }
+        if !before.operations.active.is_empty() {
+            continue;
+        }
+        let Ok(observed) = backend
+            .request(LIFECYCLE_CLIENT_ID, "connection.observe", json!({}))
+            .await
+        else {
+            continue;
+        };
+        match observed.get("status").and_then(Value::as_str) {
+            Some("connected") if observed.get("owned").and_then(Value::as_bool) == Some(true) => {
+                owned_operations = Some(
+                    before
+                        .operations
+                        .recent
+                        .iter()
+                        .map(|operation| operation.id.clone())
+                        .collect::<HashSet<_>>(),
+                );
+            }
+            Some("disconnected" | "error") => {
+                if let Some(baseline) = owned_operations.take() {
+                    if !connection_sequence_interrupted(
+                        &state_rx.borrow(),
+                        &baseline,
+                        LIFECYCLE_CLIENT_ID,
+                    ) {
+                        reconnect_after_resume(&backend, &store, &state_rx, true).await;
+                    }
+                }
+            }
+            Some("connected") => owned_operations = None,
+            _ => {}
+        }
+    }
 }
 
 async fn monitor_wifi(state_tx: watch::Sender<StateSnapshot>, network: NetworkManagerBackend) {
@@ -356,5 +413,82 @@ mod tests {
         assert!(should_reconnect(true, true));
         assert!(should_reconnect(false, true));
         assert!(!should_reconnect(false, false));
+    }
+    async fn assert_unexpected_disconnect(manual: Option<&str>, owned: bool, recover: bool) {
+        let root = std::env::temp_dir().join(format!("proton-monitor-{}", uuid::Uuid::new_v4()));
+        let (state, receiver) = watch::channel(StateSnapshot::default());
+        let operations = OperationCoordinator::new(state.clone());
+        let store = StoreHandle::open(
+            root.join("state.json"),
+            &root.join("legacy.json"),
+            root.join("config/proton-vpn-omarchy/lifecycle.json"),
+            state.clone(),
+            operations.clone(),
+        )
+        .unwrap();
+        state.send_modify(|s| {
+            s.account.status = AccountStatus::SignedIn;
+            s.connection.status = ConnectionStatus::Connected;
+        });
+        let (tx, mut requests) = mpsc::channel(16);
+        let backend = BackendHandle::new(tx, operations.clone(), BackendFlavor::Native);
+        let task = tokio::spawn(monitor_connection(receiver, backend, store));
+        let request = requests.recv().await.unwrap();
+        assert_eq!(request.method, "connection.observe");
+        request
+            .reply
+            .send(Ok(json!({"status":"connected", "owned": owned})))
+            .unwrap();
+        tokio::task::yield_now().await;
+        if let Some(method) = manual {
+            let lease = operations.begin("user", method).unwrap();
+            operations.finish(lease, Ok(()));
+        }
+        tokio::time::advance(Duration::from_secs(2)).await;
+        let request = requests.recv().await.unwrap();
+        assert_eq!(request.method, "connection.observe");
+        state.send_modify(|s| s.connection.status = ConnectionStatus::Disconnected);
+        request
+            .reply
+            .send(Ok(json!({"status":"disconnected", "owned":false})))
+            .unwrap();
+        if recover {
+            let request = requests.recv().await.unwrap();
+            assert_eq!(request.method, "connection.observe");
+            request
+                .reply
+                .send(Ok(json!({"status":"disconnected"})))
+                .unwrap();
+            let request = requests.recv().await.unwrap();
+            assert_eq!(request.method, "connection.connect");
+            state.send_modify(|s| s.connection.status = ConnectionStatus::Connected);
+            request.reply.send(Ok(json!({}))).unwrap();
+        } else {
+            assert!(
+                tokio::time::timeout(Duration::from_secs(1), requests.recv())
+                    .await
+                    .is_err()
+            );
+        }
+        task.abort();
+        let _ = task.await;
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unexpected_owned_tunnel_drop_reconnects_without_auto_connect() {
+        assert_unexpected_disconnect(None, true, true).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn monitor_does_not_reconnect_after_manual_actions_or_an_external_vpn() {
+        for action in [
+            "connection.disconnect",
+            "connection.cancel",
+            "account.logout",
+        ] {
+            assert_unexpected_disconnect(Some(action), true, false).await;
+        }
+        assert_unexpected_disconnect(None, false, false).await;
     }
 }

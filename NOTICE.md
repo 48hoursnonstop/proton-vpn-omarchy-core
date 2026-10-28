@@ -30,3 +30,13 @@ core and ProTun NetworkManager service. Those Python packages and ProTun itself
 are not redistributed in this repository.
 
 All original project code is distributed under GPL-3.0-or-later. See LICENSE.
+
+The public Guest Hole bootstrap data in
+`agent/src/native_backend/guest_hole_servers.json` is from Proton VPN Android,
+commit `deb11fef4092a1ecfcf51a7d40bdece9eb4c3e5e`, file
+`app/src/main/assets/GuestHoleServers.json` (GPL-3.0).
+The vendored bytes, including the trailing newline, have SHA-256
+`5cd4a67c0413b6afd54a285a48c8668700a277e06482eee76f5525c67ca22ac2`.
+Recovery uses fresh temporary WireGuard keys, direct Stealth endpoints and the
+existing pinned Proton HTTPS transport. Relay-only entries requiring the
+Windows ProTun v2 bouncing-label contract are skipped by the Linux v1 adapter.

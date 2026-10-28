@@ -71,7 +71,19 @@ pub async fn fetch(
     let (vpn_info, certificate_value, location_value, mut client_config_json) = tokio::try_join!(
         api.get("/vpn/v2", &auth),
         api.post("/vpn/v1/certificate", certificate_request, &auth),
-        api.get("/vpn/v1/location", &auth),
+        async {
+            // Location is optional metadata and must never be read through a
+            // guest tunnel (which would report its exit as the physical IP).
+            let location = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                api.get("/vpn/v1/location", &auth),
+            )
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .unwrap_or(Value::Null);
+            Ok::<_, NativeError>(location)
+        },
         api.get("/vpn/v2/clientconfig", &auth),
     )?;
 
@@ -80,7 +92,8 @@ pub async fn fetch(
         &certificate.certificate,
         signing_key.verifying_key().as_bytes(),
     )?;
-    let location: VpnLocation = decode_api_value(location_value, "VPN location")?;
+    let location: VpnLocation =
+        decode_api_value(location_value, "VPN location").unwrap_or_default();
     let now = unix_time()?;
     insert_number(
         &mut client_config_json,
@@ -260,6 +273,45 @@ fn decode_api_value<T: serde::de::DeserializeOwned>(value: Value, name: &str) ->
         )
         .with_source(error)
     })
+}
+
+pub(super) fn client_config(mut value: Value) -> NativeResult<(ClientConfig, Value)> {
+    insert_number(
+        &mut value,
+        "ExpirationTime",
+        unix_time()? + 3.0 * 60.0 * 60.0,
+    )?;
+    let config = decode_api_value_ref(&value, "VPN client configuration")?;
+    Ok((config, without_api_code(value)))
+}
+
+pub(super) fn account_info(value: Value) -> NativeResult<Value> {
+    value
+        .get("VPN")
+        .and_then(|vpn| vpn.get("MaxTier"))
+        .and_then(Value::as_u64)
+        .and_then(|tier| u8::try_from(tier).ok())
+        .ok_or_else(|| {
+            NativeError::new(
+                "api_response_invalid",
+                "Proton VPN account response is missing MaxTier",
+            )
+        })?;
+    Ok(without_api_code(value))
+}
+
+pub(super) fn location(value: Value) -> NativeResult<VpnLocation> {
+    let location: VpnLocation = decode_api_value(value, "VPN location")?;
+    if location.ip.parse::<std::net::IpAddr>().is_err()
+        || location.country.len() != 2
+        || !location.country.bytes().all(|b| b.is_ascii_alphabetic())
+    {
+        return Err(NativeError::new(
+            "api_response_invalid",
+            "Proton returned an invalid physical location",
+        ));
+    }
+    Ok(location)
 }
 
 fn decode_api_value_ref<T: serde::de::DeserializeOwned>(

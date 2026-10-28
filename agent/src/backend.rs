@@ -11,6 +11,8 @@ pub enum BackendFlavor {
 const NATIVE_METHODS: &[&str] = &[
     "account.get",
     "account.retry_restore",
+    "account.refresh",
+    "guest_hole.cancel",
     "account.upgrade_url",
     "report_issue.categories.get",
     "report_issue.submit",
@@ -47,6 +49,8 @@ const NATIVE_CAPABILITIES: &[&str] = &[
     "requests.concurrent",
     "device_location.read",
     "account.session",
+    "account.refresh",
+    "api.guest_hole.stealth",
     "account.login",
     "account.sso",
     "account.human_verification",

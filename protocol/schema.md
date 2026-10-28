@@ -125,15 +125,34 @@ Cancellation uses `account.cancel_fido2`. PIN and cancellation requests attach t
 operation rather than conflicting with it. The PIN is passed only through the private socket and a
 bounded in-memory handoff; it is never stored in snapshots, operation records or journals.
 
-The pinned public Linux API does not expose the Windows organization-SSO challenge/completion flow
-or a human-verification completion API. Those responses are therefore typed as `sso_required` and
-`human_verification_required`; the plugin must not mislabel them as bad credentials or fabricate a
-WebView flow.
+Organization SSO and human verification are implemented by the native Rust
+backend through a bounded external Chromium debugging pipe. There is no embedded
+WebView or Python runtime bridge. Authentication errors retain typed codes.
+
+`account.refresh` updates plan information and replaceable client configuration;
+it reports `account_updated`, `client_config_updated` and `location_updated`.
+Physical location is refreshed only without an active VPN and is invalidated on
+physical network changes. Token renewal alone is not an account refresh.
+
+`account.logout` records the no-reimport marker and deletes the private local session before
+best-effort remote revocation. It returns `logged_out:true` independently of
+network availability, plus `remote_revoked` for the bounded remote attempt.
+
+Guest Hole is negotiated as `api.guest_hole.stealth`. When Alternative Routing
+is enabled, foreground login/account refresh/connection preparation may recover
+transport failures through a temporary Stealth tunnel. Background reads and
+physical-location lookups cannot start it. An existing VPN or active blocking
+kill switch is preserved. `guest_hole.cancel` cancels recovery; connection Cancel
+also interrupts its operation. Stages are `guest_hole.connecting`,
+`guest_hole.requesting`, and `guest_hole.cleaning_up`. Temporary profiles never
+appear as an authenticated/Protected connection and are removed before the real
+VPN is activated. The official Linux engine applies temporary full-tunnel routes;
+this is not a per-app routing promise. See the current implementation report.
 
 ## Canonical frontend store
 
 Onboarding, locale, startup choices, profiles, recents and Default Connection are owned by the Rust
-agent. Store requests never enter the Python bridge and never initialize Proton networking. The
+agent. Store requests stay inside Rust and never initialize Proton networking. The
 small bounded summary is pushed in every state snapshot:
 
 ```json
@@ -176,20 +195,19 @@ the source, then copied into the first known account scope.
 
 ## Passive bootstrap invariants
 
-Agent/bridge startup is observation-only. Creating the Python API facade and loading persisted
-settings is allowed; creating `VPNConnector` is not. The frozen GTK application differs once a
-real GUI controller starts: `Controller.get()` calls `initialize_vpn_connector()`, which calls
-`ProtonVPNAPI.get_vpn_connector()` before normal UI operation. The port mirrors that lifecycle
-step with an explicit signed-in `connection.observe` request. It initializes/subscribes to the
-connector and publishes `connector.current_state`, but does not call `connect()`, `disconnect()`
-or `save_settings()`. Network-mutating methods remain explicit user-action paths.
+Startup loads the private session and saved policy, reconciles owned protection
+and split rules, removes orphaned recovery profiles, and observes NetworkManager.
+It does not start Guest Hole. Auto-connect and resume recovery follow the saved
+preference and manual-cancellation rules. `connection.observe` is a cached-control
+read of NetworkManager and includes `owned`; the agent also polls it independently
+of frontend visibility so terminal states cannot remain stale.
 
 The backend state therefore separates these facts instead of exposing a single `ready` bit:
 
 ```json
 {
   "backend": {
-    "kind": "proton_linux",
+    "kind": "proton_rust",
     "core_available": true,
     "connection_available": true,
     "connection_availability_known": true,
@@ -213,7 +231,7 @@ association survives GUI or agent restarts without inferring identity from serve
 `connector_initialized=false` is the expected **agent-only** idle-startup state. `status=unknown`
 is not an alias for `disconnected`. After a signed-in GUI requests `connection.observe`, the
 expected state is `connector_initialized=true`, `connection.observation_known=true`, with the
-actual frozen-core `Connected` / `Disconnected` / `Error` / transitional state. This lifecycle
+actual NetworkManager `Connected` / `Disconnected` / `Error` / transitional state. This lifecycle
 observation is required to represent a VPN connection that survived a GUI process restart.
 
 Split Tunneling has an independent `availability_known` field; once GUI lifecycle observation
@@ -229,7 +247,7 @@ The method requires a signed-in account and performs no connection or settings m
 
 ## Device location observation
 
-The Windows `DeviceLocationObserver` is mirrored as a read-only state surface. The bridge
+The Windows `DeviceLocationObserver` is mirrored as a read-only state surface. The native backend
 queries Proton's unauthenticated `vpn/location` endpoint only when NetworkManager has no active
 VPN/WireGuard tunnel, and republishes changes as part of `StateSnapshot`:
 
@@ -246,11 +264,14 @@ VPN/WireGuard tunnel, and republishes changes as part of `StateSnapshot`:
 }
 ```
 
-Startup uses the Windows zero-delay fetch; a network-address change schedules a 2-second
-refresh; an explicit transition to Disconnected schedules an 8-second refresh. Failed reads
-retain the previous observation. Missing latitude/longitude values also retain the previously
-known coordinates. This observer never initializes `VPNConnector` and never changes network
-configuration.
+The native maintenance loop checks the physical network identity every 30 seconds
+while no foreground operation is active. It uses active Ethernet/Wi-Fi addresses
+and gateways, invalidates a location on physical-network changes, and fetches a
+replacement only without active VPNs. Failed requests retry after 60 seconds;
+account refresh also requests a location refresh when safe. Both network identity
+and VPN state are checked again before accepting the response. Cached fields may
+remain in the snapshot with `known:false`; clients must honor that flag. The
+observer never activates a tunnel or Guest Hole.
 
 
 ## Account web hand-off
@@ -496,26 +517,35 @@ Windows choices are capability-disabled rather than mapped to a different backen
 are rejected for Free-tier accounts instead of being silently ignored by the local agent.
 
 - `report_issue.categories.get` — read-only dynamic Report-an-issue category provider with frozen Windows fallback validation.
-- `report_issue.submit` — user-triggered report submission through Linux `BugReportForm`; runtime validation is dry-run only.
+- `report_issue.submit` — user-triggered multipart report submission through the native API transport; verification does not send real reports.
 
 ### VPN Accelerator
 
 
 ### Protocol settings
 
-`features.protocol.selected` is the persisted frozen Linux `settings.protocol` identifier.
-`features.protocol.available` is derived only from the initialized `VPNConnector.iter_available_protocols()` registry used by frozen GTK; no protocol backend is inferred by name. `features.writes.protocol` is true only for a signed-in, observed connector in the exact public `Disconnected` state with at least one advertised protocol. This Protocol-specific proof is intentionally independent from generic `backend.connection_availability_known`: core 5.2.5 lacks the public global availability probe, so generic availability stays unknown rather than being fabricated. `protocol.set` accepts `{ "value": "<connector-advertised-id>" }`, rejects non-disconnected states and unavailable IDs, persists through the public `ProtonVPNAPI.save_settings()` path, and never Connects or Disconnects. The Windows protocol page remains structurally complete; WireGuard TCP/TLS stay visible but disabled when the frozen Linux connector does not advertise distinct backends.
+`features.protocol.selected` is the normalized persisted native protocol identifier.
+`features.protocol.available` is derived from installed official NetworkManager
+services. ProTun supplies UDP/TCP/TLS and Smart; OpenVPN supplies UDP/TCP when
+its service is installed. `protocol.set` accepts `{ "value": "<advertised-id>" }`,
+requires a signed-in account and a disconnected tunnel, and persists the choice
+without activating a connection. Missing engines are not advertised.
 
-`features.vpn_accelerator.enabled` reports the persisted Proton Linux `vpn_accelerator` setting. `features.writes.vpn_accelerator` is true only for a signed-in paid account. `feature.set` uses `feature="vpn_accelerator"` and a boolean `value`.
+`features.vpn_accelerator.enabled` reports the persisted native preference.
+`features.writes.vpn_accelerator` requires a signed-in paid account. `feature.set`
+uses `feature="vpn_accelerator"` and a boolean `value`.
 
 ### Port forwarding
 
-`features.port_forwarding.enabled` reports the persisted frozen Proton Linux `settings.features.port_forwarding` preference. For signed-in paid users, `features.writes.port_forwarding=true` and `feature.set` accepts `feature="port_forwarding"` with a boolean `value`; the public save path initializes the connector object before applying settings but does not itself connect the VPN. While a real P2P connection is active, `features.port_forwarding.active_port` is the positive `states.Connected.forwarded_port` published by the frozen Linux local-agent path. It is `null` when no forwarded port has been observed.
+`features.port_forwarding.enabled` reports the persisted native preference.
+For signed-in paid users, `feature.set` accepts `feature="port_forwarding"` with
+a boolean `value`. While a P2P tunnel is active, `active_port` comes from the
+Local Agent response and remains `null` until a forwarded port is observed.
 
 ### Anonymous crash reports
 
 `features.anonymous_crash_reports.enabled` remains false and
 `features.writes.anonymous_crash_reports` remains false. The native Rust agent
-does not currently contain a crash-capture/upload implementation, so it must
-not expose a switch that implies reports are being sent. Anonymous connection
+excludes automatic crash collection/upload by community-project scope and
+does not expose a writable upload switch. Anonymous connection
 statistics are a separate, explicit opt-in preference.

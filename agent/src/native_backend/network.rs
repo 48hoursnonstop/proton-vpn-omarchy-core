@@ -47,6 +47,7 @@ const PROTUN_INTERFACE: &str = "proton0";
 const PROTON_OMARCHY_OWNER_KEY: &str = "proton-omarchy-owner";
 const PROTON_OMARCHY_OWNER_VALUE: &str = "rust-v2";
 const PROTON_OMARCHY_PROFILE_ID_KEY: &str = "proton-omarchy-profile-id";
+const GUEST_HOLE_PURPOSE: &str = "proton-omarchy-guest-hole";
 const PROTON_OMARCHY_STABLE_ID: &str = "proton-omarchy-rust-v2";
 const IPV6_LEAK_CONNECTION_ID: &str = "pvpn-killswitch-ipv6";
 const IPV6_LEAK_INTERFACE: &str = "ipv6leakintrf0";
@@ -104,6 +105,7 @@ pub(super) struct ProtunProfile {
     pub enable_ipv6: bool,
     pub custom_dns_v4: Vec<String>,
     pub custom_dns_v6: Vec<String>,
+    pub guest_interface: Option<String>,
 }
 
 #[derive(Clone)]
@@ -205,6 +207,29 @@ impl VpnProfile {
 }
 
 impl ProtunProfile {
+    pub(super) fn guest(endpoint: &super::guest_hole::Endpoint) -> NativeResult<Self> {
+        let mut key = Zeroizing::new([0_u8; 32]);
+        OsRng.fill_bytes(key.as_mut());
+        Ok(Self {
+            id: "ProtonVPN Guest Hole".into(),
+            uuid: Uuid::new_v4().to_string(),
+            protocol: "protun-tls".into(),
+            profile_id: None,
+            settings_json: json!({"version": 1, "peers": [{
+                "id": endpoint.name, "endpoint": endpoint.ip,
+                "public-key": endpoint.public_key, "udp-ports": [],
+                "tcp-ports": [], "tls-ports": [443], "priority": 0
+            }], "pcap-file": null})
+            .to_string()
+            .replace(',', r"\,"),
+            private_key: Zeroizing::new(BASE64.encode(key.as_ref())),
+            enable_ipv6: false,
+            custom_dns_v4: vec![],
+            custom_dns_v6: vec![],
+            guest_interface: Some(super::guest_hole::interface_name()),
+        })
+    }
+
     pub fn new(
         target: &ConnectionTarget,
         protocol: &str,
@@ -282,6 +307,7 @@ impl ProtunProfile {
             enable_ipv6: settings.ipv6 && target.logical.features & FEATURE_IPV6 != 0,
             custom_dns_v4,
             custom_dns_v6,
+            guest_interface: None,
         })
     }
 
@@ -300,7 +326,9 @@ impl ProtunProfile {
         prop(
             &mut connection,
             "interface-name",
-            PROTUN_INTERFACE.to_owned(),
+            self.guest_interface
+                .clone()
+                .unwrap_or_else(|| PROTUN_INTERFACE.to_owned()),
         );
         let username = env::var("USER").unwrap_or_else(|_| "user".into());
         prop(
@@ -341,6 +369,15 @@ impl ProtunProfile {
         } else {
             prop(&mut ipv6, "method", "disabled".to_owned());
         }
+        if self.guest_interface.is_some() {
+            // ProTun's service owns full-tunnel policy routing. Do not claim
+            // that a NetworkManager route-table override can constrain it.
+            prop(&mut connection, "autoconnect", false);
+            ipv4.remove("dns-data");
+            ipv4.remove("dns-search");
+            ipv4.remove("dns-priority");
+            prop(&mut ipv4, "dns", Vec::<u32>::new());
+        }
 
         let mut vpn = PropMap::new();
         prop(&mut vpn, "service-type", PROTUN_SERVICE.to_owned());
@@ -354,6 +391,13 @@ impl ProtunProfile {
         ]);
         if let Some(profile_id) = &self.profile_id {
             data.insert(PROTON_OMARCHY_PROFILE_ID_KEY.to_owned(), profile_id.clone());
+        }
+        if self.guest_interface.is_some() {
+            // SAFETY: getuid has no preconditions and cannot fail.
+            data.insert(
+                GUEST_HOLE_PURPOSE.to_owned(),
+                unsafe { libc::getuid() }.to_string(),
+            );
         }
         prop(&mut vpn, "data", data);
         prop(
@@ -572,6 +616,60 @@ impl OpenVpnProfile {
 pub struct NetworkManagerBackend;
 
 impl NetworkManagerBackend {
+    pub(super) fn physical_network_identity(&self) -> NativeResult<Vec<String>> {
+        let connection = system_bus()?;
+        let root = connection.with_proxy(NM_BUS, NM_PATH, Duration::from_secs(5));
+        let mut identity = Vec::new();
+        for path in NetworkManager::devices(&root)
+            .map_err(|error| nm_error("list physical devices", error))?
+        {
+            let device = connection.with_proxy(NM_BUS, path, Duration::from_secs(5));
+            if Device::state(&device).unwrap_or(0) != 100
+                || !matches!(device.device_type().unwrap_or(0), 1 | 2)
+            {
+                continue;
+            }
+            let interface = Device::interface(&device)
+                .map_err(|error| nm_error("read physical interface", error))?;
+            for (ipv6, path) in [
+                (false, Device::ip4_config(&device)),
+                (true, Device::ip6_config(&device)),
+            ]
+            .into_iter()
+            .filter_map(|(ipv6, path)| path.ok().map(|path| (ipv6, path)))
+            {
+                if path == DBUS_ROOT {
+                    continue;
+                }
+                let config = connection.with_proxy(NM_BUS, path, Duration::from_secs(5));
+                let (addresses, gateway) = if ipv6 {
+                    (
+                        IP6Config::address_data(&config),
+                        IP6Config::gateway(&config),
+                    )
+                } else {
+                    (
+                        IP4Config::address_data(&config),
+                        IP4Config::gateway(&config),
+                    )
+                };
+                for entry in
+                    addresses.map_err(|error| nm_error("read physical addresses", error))?
+                {
+                    if let Some(address) = entry.get("address").and_then(|value| value.0.as_str()) {
+                        identity.push(format!("{interface}:{address}"));
+                    }
+                }
+                identity.push(format!(
+                    "{interface}:gateway:{}",
+                    gateway.unwrap_or_default()
+                ));
+            }
+        }
+        identity.sort();
+        Ok(identity)
+    }
+
     pub(super) fn wifi_security(&self) -> NativeResult<Option<WifiSecurityObservation>> {
         let connection = system_bus()?;
         let root = connection.with_proxy(NM_BUS, NM_PATH, Duration::from_secs(5));
@@ -810,6 +908,14 @@ impl NetworkManagerBackend {
     }
 
     pub fn observe(&self) -> NativeResult<TunnelObservation> {
+        self.observe_matching(None)
+    }
+
+    pub(super) fn observe_uuid(&self, uuid: &str) -> NativeResult<TunnelObservation> {
+        self.observe_matching(Some(uuid))
+    }
+
+    fn observe_matching(&self, uuid: Option<&str>) -> NativeResult<TunnelObservation> {
         let connection = system_bus()?;
         let root = connection.with_proxy(NM_BUS, NM_PATH, Duration::from_secs(5));
         for active_path in root
@@ -830,6 +936,13 @@ impl NetworkManagerBackend {
                 Ok(settings) => settings,
                 Err(_) => continue,
             };
+            if let Some(uuid) = uuid {
+                if active.uuid().ok().as_deref() != Some(uuid) {
+                    continue;
+                }
+            } else if vpn_data_string(&settings, GUEST_HOLE_PURPOSE).is_some() {
+                continue;
+            }
             if !matches!(
                 service_type(&settings).as_deref(),
                 Some(PROTUN_SERVICE | OPENVPN_SERVICE)
@@ -1169,7 +1282,7 @@ impl NetworkManagerBackend {
     }
 
     pub fn disconnect_uuid(&self, expected_uuid: &str) -> NativeResult<bool> {
-        let observation = self.observe()?;
+        let observation = self.observe_uuid(expected_uuid)?;
         let disconnected = if observation.uuid.as_deref() == Some(expected_uuid) {
             self.disconnect_observation(observation)?
         } else {
@@ -1179,7 +1292,61 @@ impl NetworkManagerBackend {
         // in ActiveConnections. Its protected credential set still belongs to
         // the attempted UUID and must be removed on every terminal cleanup.
         cleanup_openvpn_credentials(expected_uuid);
+        self.delete_inactive_owned_profile(expected_uuid)?;
         Ok(disconnected)
+    }
+
+    fn delete_inactive_owned_profile(&self, uuid: &str) -> NativeResult<()> {
+        let connection = system_bus()?;
+        let settings = connection.with_proxy(NM_BUS, NM_SETTINGS_PATH, Duration::from_secs(5));
+        for path in settings
+            .list_connections()
+            .map_err(|error| nm_error("list temporary profiles", error))?
+        {
+            let profile = connection.with_proxy(NM_BUS, path, Duration::from_secs(5));
+            let Ok(values) = profile.get_settings() else {
+                continue;
+            };
+            let matches = values
+                .get("connection")
+                .and_then(|c| c.get("uuid"))
+                .and_then(|v| v.0.as_str())
+                == Some(uuid);
+            if matches && profile_owned(&values) {
+                SettingsConnection::delete(&profile)
+                    .map_err(|error| nm_error("delete temporary profile", error))?;
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn cleanup_guest_profiles(&self) -> NativeResult<()> {
+        let connection = system_bus()?;
+        let settings = connection.with_proxy(NM_BUS, NM_SETTINGS_PATH, Duration::from_secs(5));
+        // SAFETY: getuid has no preconditions and cannot fail.
+        let uid = unsafe { libc::getuid() }.to_string();
+        for path in settings
+            .list_connections()
+            .map_err(|error| nm_error("list recovery profiles", error))?
+        {
+            let profile = connection.with_proxy(NM_BUS, path, Duration::from_secs(5));
+            let Ok(values) = profile.get_settings() else {
+                continue;
+            };
+            if vpn_data_string(&values, GUEST_HOLE_PURPOSE).as_deref() != Some(&uid)
+                || !profile_owned(&values)
+            {
+                continue;
+            }
+            if let Some(uuid) = values
+                .get("connection")
+                .and_then(|c| c.get("uuid"))
+                .and_then(|v| v.0.as_str())
+            {
+                self.disconnect_uuid(uuid)?;
+            }
+        }
+        Ok(())
     }
 
     fn disconnect_observation(&self, observation: TunnelObservation) -> NativeResult<bool> {
@@ -2040,6 +2207,7 @@ mod tests {
                 enable_ipv6,
                 custom_dns_v4: vec![],
                 custom_dns_v6: vec!["2001:db8::53".into()],
+                guest_interface: None,
             };
             let settings = profile.dbus_settings();
             assert_eq!(settings["connection"]["llmnr"].0.as_i64(), Some(0));
@@ -2053,3 +2221,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod guest_tests;

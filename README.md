@@ -62,6 +62,17 @@ while waiting for the keyring, and resume reconnection stops after manual
 actions or permanent failures. It retains the LAN tunnel-gateway fix, server
 validation and connection improvements. The RC1 keyring format is unchanged.
 
+## Local runtime fixes, 2026-10-28
+
+The current working branch adds split-tunneling packet-mark fixes, Qt 6.12
+compatibility in the companion plugin, continuous tunnel observation, bounded
+logout and remote-data refresh, and temporary foreground Stealth Guest Hole
+recovery. See [implementation and validation](reference/RUNTIME_FIXES_2026-10-28.md)
+for tested behavior, source provenance and the remaining live-network limitations.
+These local changes are not a new signed upstream release. Automatic crash
+uploads are outside this independent project's scope; the supported interface
+languages remain English and Spanish.
+
 ## GNOME Keyring compatibility
 
 Omarchy's passwordless default GNOME Keyring stores secrets in a textual

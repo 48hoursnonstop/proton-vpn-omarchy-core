@@ -354,6 +354,12 @@ fn operation_spec(method: &str) -> Option<OperationSpec> {
             false,
             None,
         ),
+        "account.refresh" => (
+            OperationDomain::AuthSession,
+            "auth.loading_account",
+            false,
+            None,
+        ),
         "connection.connect" => (
             OperationDomain::TunnelConfiguration,
             "tunnel.preparing_connection",
