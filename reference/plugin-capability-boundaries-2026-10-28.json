@@ -1,5 +1,5 @@
 {
-  "checkpoint": "runtime-fixes-2026-10-28",
+  "checkpoint": "release-0.9.11",
   "audited_at": "2026-10-28",
   "target": {
     "omarchy": "4.0.6; Qt 6.12",
@@ -11,7 +11,7 @@
     "local_agent_reference_commit": "74ec6f4f093805d766f11f9ef522bf1120591058"
   },
   "native_backend": {
-    "version": "0.9.10/rust-v2 with local 2026-10-28 fixes",
+    "version": "0.9.11/rust-v2",
     "only_runtime_backend": true,
     "legacy_python_bridge": "removed from runtime and package",
     "tunnel_engines": {
@@ -54,10 +54,14 @@
   },
   "validation": {
     "unit_tests": "passed; see RUNTIME_FIXES_2026-10-28.md",
-    "live_tunnel_tested": false,
-    "real_packet_delivery_tested": false,
+    "live_tunnel_tested": true,
+    "real_packet_delivery_tested": true,
     "keyring_namespace_changed": false,
     "automatic_crash_reports": "excluded by project scope",
-    "locales": "English and Spanish by current product scope"
+    "locales": "English and Spanish by current product scope",
+    "live_tunnel_scope": "authenticated ProTun TLS/Stealth and HTTPS on MX, NL, CH; MX egress verified",
+    "guest_hole_full_api_recovery_tested": false,
+    "split_udp_real_delivery_tested": false,
+    "full_kill_switch_matrix_tested": false
   }
 }

@@ -1,7 +1,7 @@
 {
-  "checkpoint": "runtime-fixes-2026-10-28",
+  "checkpoint": "release-0.9.11",
   "audited_at": "2026-10-28",
-  "decision": "IMPLEMENTED_WITH_LIVE_NETWORK_VALIDATION_PENDING",
+  "decision": "IMPLEMENTED_WITH_PARTIAL_LIVE_NETWORK_VALIDATION",
   "backend": {
     "only": "native_rust_v2",
     "legacy_fallback": null,
@@ -79,10 +79,14 @@
   },
   "validation": {
     "unit_tests": "passed; see RUNTIME_FIXES_2026-10-28.md",
-    "live_tunnel_tested": false,
-    "real_packet_delivery_tested": false,
+    "live_tunnel_tested": true,
+    "real_packet_delivery_tested": true,
     "keyring_namespace_changed": false,
     "automatic_crash_reports": "excluded by project scope",
-    "locales": "English and Spanish by current product scope"
+    "locales": "English and Spanish by current product scope",
+    "live_tunnel_scope": "authenticated ProTun TLS/Stealth and HTTPS on MX, NL, CH; MX egress verified",
+    "guest_hole_full_api_recovery_tested": false,
+    "split_udp_real_delivery_tested": false,
+    "full_kill_switch_matrix_tested": false
   }
 }

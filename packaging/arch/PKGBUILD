@@ -1,5 +1,5 @@
 pkgname=proton-vpn-omarchy
-pkgver=0.9.10
+pkgver=0.9.11
 pkgrel=1
 pkgdesc="Native Proton VPN backend and Rust split tunneling service for Omarchy Quattro"
 url="https://github.com/48hoursnonstop/proton-vpn-omarchy-core"
@@ -20,7 +20,7 @@ makedepends=('rust>=1.75')
 options=('!debug' '!lto')
 install=proton-vpn-omarchy.install
 source=("$pkgname-$pkgver.tar.gz")
-sha256sums=('94516cb79a32f02524a3198f1ec06de086e598c0f2799bb234b4be368adad222')
+sha256sums=('911ccb1908b13b83f79d87ff88fefa76489fcb7dd2b732b52b849de265182316')
 
 build() {
   cd "$pkgname-$pkgver"
@@ -68,11 +68,14 @@ package() {
     "$pkgdir/usr/share/doc/$pkgname/protocol-schema.md"
   install -Dm644 reference/PLUGIN_FIRST_PRODUCT_CONTRACT_2026-08-24.md \
     "$pkgdir/usr/share/doc/$pkgname/product-contract.md"
-  install -Dm644 reference/plugin-capability-boundaries-2026-08-26.json \
+  install -Dm644 reference/plugin-capability-boundaries-2026-10-28.json \
     "$pkgdir/usr/share/doc/$pkgname/capability-boundaries.json"
-  install -Dm644 reference/plugin-feature-completeness-2026-08-26.json \
+  install -Dm644 reference/plugin-feature-completeness-2026-10-28.json \
     "$pkgdir/usr/share/doc/$pkgname/feature-completeness.json"
   install -Dm644 reference/SECURITY_AUDIT_2026-08-28.md \
     "$pkgdir/usr/share/doc/$pkgname/security-audit.md"
+  install -Dm644 reference/RUNTIME_FIXES_2026-10-28.md \
+    "$pkgdir/usr/share/doc/$pkgname/implementation-report.md"
+  install -Dm644 NOTICE.md "$pkgdir/usr/share/licenses/$pkgname/NOTICE.md"
   install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
 }

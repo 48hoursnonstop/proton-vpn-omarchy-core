@@ -70,6 +70,8 @@ jobs:
             HOME=/home/builder \
             CARGO_HOME=/home/builder/.cargo \
             cargo fetch --locked --manifest-path "$GITHUB_WORKSPACE/Cargo.toml"
+          runuser --user builder -- bash \
+            "$GITHUB_WORKSPACE/tests/protun-metadata.sh"
           runuser --user builder -- env \
             HOME=/home/builder \
             CARGO_HOME=/home/builder/.cargo \

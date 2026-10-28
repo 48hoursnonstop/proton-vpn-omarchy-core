@@ -56,22 +56,28 @@ recipe and uses the tracked `packaging/release/SOURCE_DATE_EPOCH`.
 
 Use the guided, signature-verifying installer in the [Omarchy plugin][plugin].
 It installs the matching package and configures systemd socket activation.
-Manual package downloads are available from the [0.9.10 release][release].
-The stable Arch package is `0.9.10-1`. Startup cancellation remains effective
-while waiting for the keyring, and resume reconnection stops after manual
-actions or permanent failures. It retains the LAN tunnel-gateway fix, server
-validation and connection improvements. The RC1 keyring format is unchanged.
+Manual package downloads are available from the [0.9.11 release][release].
+The stable Arch package is `0.9.11-1`.
 
-## Local runtime fixes, 2026-10-28
+## 0.9.11 runtime fixes
 
-The current working branch adds split-tunneling packet-mark fixes, Qt 6.12
-compatibility in the companion plugin, continuous tunnel observation, bounded
-logout and remote-data refresh, and temporary foreground Stealth Guest Hole
-recovery. See [implementation and validation](reference/RUNTIME_FIXES_2026-10-28.md)
-for tested behavior, source provenance and the remaining live-network limitations.
-These local changes are not a new signed upstream release. Automatic crash
-uploads are outside this independent project's scope; the supported interface
-languages remain English and Spanish.
+This release fixes IPv6 and repeated-UDP split-tunneling marks, continuously
+observes owned tunnels, recovers unexpected drops, completes local logout when
+the API is unreachable, and refreshes account/configuration data. The companion
+plugin fixes Qt 6.12 color resolution and adds account-refresh and recovery
+cancellation controls. Private keyring formats remain compatible with 0.9.6-rc1.
+
+Foreground Guest Hole can recover blocked API transport through a temporary
+Stealth tunnel. Linux ProTun applies full-tunnel routes and tunnel DNS during
+recovery; existing VPNs and blocking kill switches are preserved. Only direct
+endpoints are supported by the installed ProTun v1 contract. Complete Guest Hole
+API recovery still needs live validation. Ordinary authenticated Stealth tunnels
+and HTTPS traffic were verified on the test network.
+
+See [implementation and validation](reference/RUNTIME_FIXES_2026-10-28.md) for
+source provenance and remaining integration-test coverage. Automatic crash
+uploads are excluded by project scope. Supported languages remain English and
+Spanish.
 
 ## GNOME Keyring compatibility
 
@@ -167,4 +173,4 @@ Original project code is GPL-3.0-or-later. Vendored and upstream-derived files
 retain their own notices and license files; see `NOTICE.md`.
 
 [plugin]: https://github.com/48hoursnonstop/proton-vpn-omarchy
-[release]: https://github.com/48hoursnonstop/proton-vpn-omarchy-core/releases/tag/v0.9.10
+[release]: https://github.com/48hoursnonstop/proton-vpn-omarchy-core/releases/tag/v0.9.11

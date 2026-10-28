@@ -1,9 +1,8 @@
 # Implementación de las correcciones — 28 de octubre de 2026
 
 Esta revisión parte del núcleo 0.9.10 (`49ac4811718f32d19c1785efcd9320baa6ccadb0`)
-y del plugin instalado (`7f48b37b59d4a4496bf20907daf5468653a6310c`). Es una
-compilación local de un proyecto independiente de Proton. No es una publicación
-oficial ni una declaración de paridad completa con Windows.
+y del plugin instalado (`7f48b37b59d4a4496bf20907daf5468653a6310c`). Las correcciones se publican en la versión 0.9.11 de este proyecto independiente
+de Proton. No se declara paridad completa con Windows.
 
 ## Cambios de funcionamiento y seguridad
 
@@ -33,7 +32,7 @@ oficial ni una declaración de paridad completa con Windows.
 
 ## Guest Hole mediante Stealth
 
-El usuario autorizó incluir esta función. Con Enrutamiento alternativo activado,
+Con Enrutamiento alternativo activado,
 un fallo de transporte en una operación de inicio de sesión, actualización manual
 de cuenta o preparación de conexión puede abrir un túnel temporal ProTun TLS en
 443. Los procesos de mantenimiento, las lecturas de ubicación y cerrar sesión no
@@ -63,7 +62,7 @@ ese campo; se conserva por ello la entrada DNS normal de Proton (`10.2.0.1`).
 La interfaz ProTun v1 instalada no admite el campo de relay/bouncing de los
 clientes recientes. Se omiten entradas bootstrap sin `EntryIP` directo. Esta
 implementación cubre Stealth directo; no afirma soporte de relays v2, fallback
-Guest Hole OpenVPN ni disponibilidad frente a Fortinet.
+Guest Hole OpenVPN ni disponibilidad de todos los servidores en redes con Fortinet.
 
 ## Validación y límites
 
@@ -80,14 +79,26 @@ Guest Hole OpenVPN ni disponibilidad frente a Fortinet.
 - La compilación optimizada del agente y splitd termina correctamente, con las
   dependencias bloqueadas y sin acceso a la red para Cargo.
 - La prueba eBPF opcional carga programas y mapas de prueba en el kernel **sin
-  adjuntarlos a ningún cgroup**. Su ejecución con permisos se registra por
-  separado junto al paquete local.
+  adjuntarlos a ningún cgroup**. Los cuatro programas pasan el verificador
+  del kernel del equipo de pruebas.
 
-No se intentan conexiones VPN reales desde la red protegida por Fortinet, ni
-se envían reportes de soporte/telemetría. Quedan pendientes las pruebas reales
-de acceso Guest Hole, reconexión, entrega de paquetes UDP alternando destinos,
-familias IPv4/IPv6 y coexistencia con kill switch. Las pruebas de lógica y
-verificador no sustituyen esas pruebas de integración.
+Se probaron conexiones autenticadas Stealth con MX#191, NL#877 y CH#1110 desde
+una red con Fortinet. Los tres establecieron la sesión Local Agent y transportaron
+solicitudes HTTPS. Una repetición de MX#191 confirmó cambio de salida respecto
+a la red física, coincidencia entre dos servicios HTTPS independientes y una
+ruta IPv4 por la interfaz VPN. No se publican IP, tokens ni identificadores de
+cuenta del equipo de pruebas.
+
+La prueba real también reprodujo cinco rechazos locales de perfiles Guest Hole
+por el campo DNS vacío. Se conserva ahora la entrada DNS del túnel; la prueba
+`tests/protun-profile-normalization.py` verifica la normalización con libnm sin
+activar conexiones.
+
+No se enviaron reportes de soporte ni se activó telemetría. Quedan pendientes
+la recuperación completa del API por Guest Hole, la reconexión tras caída real,
+la entrega UDP alternando destinos, las combinaciones IPv4/IPv6 y la coexistencia
+con kill switch. Las pruebas de lógica y del verificador no sustituyen esa
+cobertura de integración.
 
 Los primeros fallos de workspace/teclado de la auditoría se debían parcialmente
 a reentrada del Timer dentro de los bucles de eventos de QtTest. Los fixtures
