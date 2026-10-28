@@ -14,6 +14,9 @@ oficial ni una declaración de paridad completa con Windows.
   el bypass para un destino distinto. Se preservan las marcas ajenas al proyecto.
 - **Qt 6.12:** el plugin usa explícitamente `Commons.Color`, evitando la colisión
   que devolvía colores indefinidos en el shell actual.
+- **Instalación en Arch actual:** el hook reconoce las dos rutas oficiales de
+  ProTun (`/usr/lib/` y `/usr/libexec/`) y continúa rechazando rutas arbitrarias.
+  La normalización y su retirada se verifican con archivos desechables.
 - **Observación continua:** el agente comprueba el estado del túnel cada dos
   segundos aunque el panel esté cerrado. Una caída inesperada de un túnel propio
   activa la recuperación existente, con límites y cancelación. Una desconexión

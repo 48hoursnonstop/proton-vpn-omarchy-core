@@ -54,7 +54,8 @@ validate_descriptor() {
     printf 'proton-omarchy-protun-metadata: refusing unknown descriptor: %s\n' "$descriptor" >&2
     exit 1
   }
-  grep -Fxq 'program=/usr/libexec/nm-protun-service' "$descriptor" || {
+  # Arch uses /usr/lib; upstream and older packages use /usr/libexec.
+  grep -Exq 'program=/usr/lib(exec)?/nm-protun-service' "$descriptor" || {
     printf 'proton-omarchy-protun-metadata: refusing unknown ProTun program\n' >&2
     exit 1
   }

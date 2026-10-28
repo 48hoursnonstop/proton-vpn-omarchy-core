@@ -92,4 +92,23 @@ changed_sha=$(sha256sum "$descriptor")
 run_helper --restore
 [[ $(sha256sum "$descriptor") == "$changed_sha" ]]
 
+# Current Arch packages use /usr/lib instead of the upstream /usr/libexec.
+rm -rf -- "$state_dir"
+sed -i -e 's@program=/usr/libexec/nm-protun-service@program=/usr/lib/nm-protun-service@' \
+  -e '/supports-safe-private-file-access=true/d' "$descriptor"
+cp "$descriptor" "$original"
+run_helper
+run_helper --restore
+cmp -s "$descriptor" "$original"
+
+# The compatibility change must not accept arbitrary executable paths.
+sed -i 's@program=/usr/lib/nm-protun-service@program=/tmp/nm-protun-service@' "$descriptor"
+before=$(sha256sum "$descriptor")
+if run_helper >"$workdir/rejected.log" 2>&1; then
+  printf 'unknown ProTun program was accepted\n' >&2
+  exit 1
+fi
+[[ $(sha256sum "$descriptor") == "$before" ]]
+[[ ! -e $state_dir ]]
+
 printf 'protun metadata normalization and rollback: ok\n'
