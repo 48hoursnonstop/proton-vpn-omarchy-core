@@ -55,8 +55,10 @@ quedado después de una interrupción.
 El túnel temporal no aparece como sesión autenticada o estado Protegido. No
 sustituye una VPN existente ni desactiva un kill switch que bloquee la red.
 **El motor oficial Linux instala rutas temporales de túnel completo**: durante
-la recuperación puede interrumpirse brevemente otro tráfico IPv4. El perfil no
-cambia el DNS global ni se configura para conexión automática.
+la recuperación puede interrumpirse brevemente otro tráfico IPv4. El perfil usa
+temporalmente el DNS del túnel y no se configura para conexión automática. La
+prueba real encontró que NetworkManager omite listas DNS vacías y ProTun exige
+ese campo; se conserva por ello la entrada DNS normal de Proton (`10.2.0.1`).
 
 La interfaz ProTun v1 instalada no admite el campo de relay/bouncing de los
 clientes recientes. Se omiten entradas bootstrap sin `EntryIP` directo. Esta

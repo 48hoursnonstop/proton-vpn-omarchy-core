@@ -1,7 +1,7 @@
 use super::*;
 
 #[test]
-fn guest_profiles_have_fresh_keys_and_leave_dns_and_autostart_unchanged() {
+fn guest_profiles_have_fresh_keys_required_dns_and_no_autostart() {
     let endpoint = crate::native_backend::guest_hole::Endpoint {
         name: "Fixture".into(),
         ip: "192.0.2.1".into(),
@@ -14,9 +14,11 @@ fn guest_profiles_have_fresh_keys_and_leave_dns_and_autostart_unchanged() {
     let settings = first.dbus_settings();
     let ipv4 = &settings["ipv4"];
     assert_eq!(cast::<bool>(&*ipv4["ignore-auto-dns"].0), Some(&true));
-    assert!(!ipv4.contains_key("dns-data"));
-    assert!(!ipv4.contains_key("dns-search"));
-    assert_eq!(cast::<Vec<u32>>(&*ipv4["dns"].0), Some(&vec![]));
+    assert_eq!(
+        cast::<Vec<String>>(&*ipv4["dns-data"].0),
+        Some(&vec!["10.2.0.1".to_owned()])
+    );
+    assert_eq!(ipv4["dns-priority"].0.as_i64(), Some(-1500));
     assert!(!ipv4.contains_key("routing-rules"));
     assert!(!ipv4.contains_key("route-table"));
     assert_eq!(

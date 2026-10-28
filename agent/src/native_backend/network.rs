@@ -373,10 +373,8 @@ impl ProtunProfile {
             // ProTun's service owns full-tunnel policy routing. Do not claim
             // that a NetworkManager route-table override can constrain it.
             prop(&mut connection, "autoconnect", false);
-            ipv4.remove("dns-data");
-            ipv4.remove("dns-search");
-            ipv4.remove("dns-priority");
-            prop(&mut ipv4, "dns", Vec::<u32>::new());
+            // Keep the tunnel DNS entry: NetworkManager drops empty arrays
+            // while normalizing profiles, but ProTun requires the dns field.
         }
 
         let mut vpn = PropMap::new();
